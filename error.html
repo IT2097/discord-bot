@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>エラー | マッチング会員一覧</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="error-wrap">
+    <div class="error-card">
+      <p class="eyebrow">Error</p>
+      <h1>うまくいきませんでした</h1>
+      <p>{{ message }}</p>
+    </div>
+  </div>
+</body>
+</html>

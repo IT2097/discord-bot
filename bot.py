@@ -1,6 +1,16 @@
+from __future__ import annotations
+
 import os
+import asyncio
+import io
+import threading
+
 import discord
 from discord.ext import commands
+
+import match_views
+import sheet_sync
+import web_app
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -8,7 +18,22 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Botのイベントループへの参照。on_ready で確定させる。
+bot_loop: asyncio.AbstractEventLoop | None = None
 
+
+def run_coro(coro, timeout: int = 15):
+    """
+    Flask（別スレッド）からBotの非同期処理を呼び出すためのヘルパー。
+    Bot側の処理が終わるまでブロックして結果を返す。
+    """
+    if bot_loop is None:
+        raise RuntimeError("Botがまだ起動していません。")
+    future = asyncio.run_coroutine_threadsafe(coro, bot_loop)
+    return future.result(timeout=timeout)
+
+
+# --- 旧来の「!setup」コマンド（チャンネル内でボタンを押して即マッチング）も引き続き利用可能 ---
 class MatchView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -16,14 +41,9 @@ class MatchView(discord.ui.View):
     @discord.ui.button(
         label="マッチングする",
         style=discord.ButtonStyle.primary,
-        custom_id="persistent_match_button"
+        custom_id="persistent_match_button",
     )
-    async def match_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        # 先に応答を保留して「インタラクション失敗」を防ぐ
+    async def match_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
 
         guild = interaction.guild
@@ -31,106 +51,110 @@ class MatchView(discord.ui.View):
         user = interaction.user
 
         if guild is None or message is None:
-            await interaction.followup.send(
-                "サーバー内で実行してください。",
-                ephemeral=True
-            )
+            await interaction.followup.send("サーバー内で実行してください。", ephemeral=True)
             return
 
-        # !setupを実行した人は、募集メッセージ内の最初のメンション
         if not message.mentions:
             await interaction.followup.send(
                 "募集を作成した会員が確認できません。もう一度 !setup を実行してください。",
-                ephemeral=True
+                ephemeral=True,
             )
             return
 
         owner = message.mentions[0]
 
         if user.id == owner.id:
-            await interaction.followup.send(
-                "自分のボタンは押せません。",
-                ephemeral=True
-            )
+            await interaction.followup.send("自分のボタンは押せません。", ephemeral=True)
             return
-
-        bot_member = guild.me
-
-        if bot_member is None:
-            await interaction.followup.send(
-                "Bot情報を取得できませんでした。",
-                ephemeral=True
-            )
-            return
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(
-                view_channel=False
-            ),
-            owner: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
-            ),
-            user: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
-            ),
-            bot_member: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                manage_channels=True,
-                read_message_history=True
-            )
-        }
 
         try:
-            channel = await guild.create_text_channel(
-                name=f"{owner.display_name}-{user.display_name}",
-                overwrites=overwrites
-            )
-
-            await channel.send(
-                f"{owner.mention} と {user.mention} のマッチングルームです！"
-            )
-
+            channel = await match_views.create_match_channel(guild, owner, user)
             await interaction.followup.send(
-                f"マッチングルームを作成しました：{channel.mention}",
-                ephemeral=True
+                f"マッチングルームを作成しました：{channel.mention}", ephemeral=True
             )
-
         except discord.Forbidden:
             await interaction.followup.send(
-                "Botに「チャンネルを管理」の権限がありません。",
-                ephemeral=True
+                "Botに「チャンネルを管理」の権限がありません。", ephemeral=True
             )
-
         except discord.HTTPException as error:
-            await interaction.followup.send(
-                f"チャンネル作成に失敗しました：{error}",
-                ephemeral=True
-            )
+            await interaction.followup.send(f"チャンネル作成に失敗しました：{error}", ephemeral=True)
 
 
 @bot.command()
 async def setup(ctx: commands.Context):
-    await ctx.send(
-        f"{ctx.author.mention} のマッチング募集👇",
-        view=MatchView()
-    )
+    await ctx.send(f"{ctx.author.mention} のマッチング募集👇", view=MatchView())
+
+
+@bot.command(name="id同期")
+@commands.has_permissions(administrator=True)
+async def sync_ids(ctx: commands.Context):
+    """
+    サーバーメンバーのDiscordニックネームとスプレッドシートの「名前（本名）」を
+    自動で突き合わせ、一致した分だけDiscordIDをシートに書き込む管理者向けコマンド。
+    """
+    await ctx.send("Discordメンバーとスプレッドシートを突き合わせています…（少し時間がかかります）")
+
+    guild_members = [(str(m.id), m.display_name) for m in ctx.guild.members if not m.bot]
+
+    try:
+        result = await asyncio.to_thread(sheet_sync.sync_discord_ids, guild_members)
+    except Exception as error:  # noqa: BLE001 - 管理者にそのままエラー内容を見せる
+        await ctx.send(f"エラーが発生しました：{error}")
+        return
+
+    lines = [f"✅ {result['matched']}件、DiscordIDを自動入力しました。"]
+
+    if result["ambiguous_names"]:
+        lines.append("")
+        lines.append("⚠️ 同名のDiscordメンバーが複数いたため、自動判定をスキップしました（手動確認してください）：")
+        lines.append("、".join(result["ambiguous_names"]))
+
+    if result["unmatched_sheet_names"]:
+        lines.append("")
+        lines.append("📋 シートにあるがDiscordで一致しなかった名前：")
+        lines.append("、".join(result["unmatched_sheet_names"]))
+
+    if result["unmatched_discord_names"]:
+        lines.append("")
+        lines.append("👤 Discordにいるがシートで一致しなかった表示名：")
+        lines.append("、".join(result["unmatched_discord_names"]))
+
+    message = "\n".join(lines)
+
+    if len(message) <= 1900:
+        await ctx.send(message)
+    else:
+        # Discordの1メッセージ2000文字制限を超える場合はテキストファイルで送る
+        buffer = io.StringIO(message)
+        await ctx.send(
+            "結果が長くなったのでファイルに出力しました。",
+            file=discord.File(fp=buffer, filename="id同期結果.txt"),
+        )
 
 
 @bot.event
 async def on_ready():
+    global bot_loop
+    bot_loop = asyncio.get_running_loop()
+
     # Railway再起動後も既存ボタンを反応させる
     bot.add_view(MatchView())
     print(f"ログインしました: {bot.user}")
+
+
+def start_web_server():
+    app = web_app.create_app(bot, run_coro)
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
 
 
 token = os.getenv("TOKEN")
 
 if not token:
     raise RuntimeError("RailwayのVariablesにTOKENが設定されていません。")
+
+# WebサーバーはBotとは別スレッドで動かす（Botのループはメインスレッドで動かし続ける）
+web_thread = threading.Thread(target=start_web_server, daemon=True)
+web_thread.start()
 
 bot.run(token)

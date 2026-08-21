@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>マッチング会員一覧</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div>
+        <p class="eyebrow">Matching Board</p>
+        <h1>マッチング会員一覧</h1>
+      </div>
+      <div class="me">
+        <span>{{ my_name }} としてログイン中</span>
+        <a href="{{ url_for('logout') }}">ログアウト</a>
+      </div>
+    </div>
+
+    {% if members %}
+    <div class="grid">
+      {% for member in members %}
+      <div class="card">
+        <div class="card-top">
+          <div class="avatar">{{ member.name[0] }}</div>
+          <div class="name-block">
+            <div class="name">{{ member.name }}</div>
+            <div class="status">
+              {% if member.discord_id in pending %}
+                <span class="dot pending"></span> 申請中
+              {% else %}
+                <span class="dot"></span> 申請可能
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        {% if member.discord_id in pending %}
+          <button class="request-btn" disabled>返信待ちです</button>
+        {% else %}
+          <button class="request-btn" data-target="{{ member.discord_id }}">マッチング希望を送る</button>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+      <p class="empty">表示できる会員がいません。</p>
+    {% endif %}
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    const toast = document.getElementById('toast');
+    let toastTimer;
+
+    function showToast(message) {
+      toast.textContent = message;
+      toast.classList.add('show');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toast.classList.remove('show'), 3200);
+    }
+
+    document.querySelectorAll('.request-btn[data-target]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const targetId = btn.dataset.target;
+        btn.disabled = true;
+        btn.textContent = '送信中…';
+
+        try {
+          const res = await fetch(`/request/${targetId}`, { method: 'POST' });
+          const data = await res.json();
+
+          showToast(data.message);
+
+          if (data.ok) {
+            btn.textContent = '返信待ちです';
+            const dot = btn.closest('.card').querySelector('.dot');
+            dot.classList.add('pending');
+          } else {
+            btn.disabled = false;
+            btn.textContent = 'マッチング希望を送る';
+          }
+        } catch (err) {
+          showToast('通信エラーが発生しました。');
+          btn.disabled = false;
+          btn.textContent = 'マッチング希望を送る';
+        }
+      });
+    });
+  </script>
+</body>
+</html>

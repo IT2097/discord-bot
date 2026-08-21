@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ログイン | マッチング会員一覧</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="login-card">
+      <div class="login-icon">💬</div>
+      <h1>マッチング会員一覧</h1>
+      <p>Discordアカウントでログインすると、会員一覧からマッチング希望を送れます。</p>
+      <a class="discord-btn" href="{{ url_for('login') }}">Discordでログイン</a>
+    </div>
+  </div>
+</body>
+</html>
