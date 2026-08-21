@@ -21,6 +21,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Botのイベントループへの参照。on_ready で確定させる。
 bot_loop: asyncio.AbstractEventLoop | None = None
 
+# 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
+MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
+WEB_APP_URL = os.getenv("WEB_APP_URL")
+
 
 def run_coro(coro, timeout: int = 15):
     """
@@ -132,6 +136,35 @@ async def sync_ids(ctx: commands.Context):
         )
 
 
+async def post_matching_room_link():
+    """
+    「マッチングルーム」チャンネルに、会員情報確認・マッチング申請ページの
+    固定URLを投稿する。すでに投稿済み（直近の履歴にBot自身の同じURL投稿がある）
+    場合は再投稿しない（Railway再起動のたびにスパムしないため）。
+    """
+    guild_id = os.getenv("GUILD_ID")
+
+    if not guild_id or not WEB_APP_URL:
+        print("GUILD_ID または WEB_APP_URL が未設定のため、リンク投稿をスキップしました。")
+        return
+
+    guild = bot.get_guild(int(guild_id))
+    if guild is None:
+        print("マッチングルームへの投稿に失敗：Botが指定サーバーに参加していません。")
+        return
+
+    channel = discord.utils.get(guild.text_channels, name=MATCHING_ROOM_CHANNEL_NAME)
+    if channel is None:
+        print(f"「{MATCHING_ROOM_CHANNEL_NAME}」という名前のテキストチャンネルが見つかりませんでした。")
+        return
+
+    async for message in channel.history(limit=20):
+        if message.author.id == bot.user.id and WEB_APP_URL in message.content:
+            return  # すでに投稿済み
+
+    await channel.send(f"🔗 会員情報の確認・マッチング申請はこちらから！\n{WEB_APP_URL}")
+
+
 @bot.event
 async def on_ready():
     global bot_loop
@@ -140,6 +173,8 @@ async def on_ready():
     # Railway再起動後も既存ボタンを反応させる
     bot.add_view(MatchView())
     print(f"ログインしました: {bot.user}")
+
+    await post_matching_room_link()
 
 
 def start_web_server():
