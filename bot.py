@@ -25,6 +25,9 @@ bot_loop: asyncio.AbstractEventLoop | None = None
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
 WEB_APP_URL = os.getenv("WEB_APP_URL")
 
+# 新規メンバー参加時に「id同期」の結果を投稿するチャンネル名
+ID_SYNC_LOG_CHANNEL_NAME = os.getenv("ID_SYNC_LOG_CHANNEL_NAME", "id同期ログ")
+
 
 def run_coro(coro, timeout: int = 15):
     """
@@ -89,21 +92,20 @@ async def setup(ctx: commands.Context):
     await ctx.send(f"{ctx.author.mention} のマッチング募集👇", view=MatchView())
 
 
-@bot.command(name="id同期")
-@commands.has_permissions(administrator=True)
-async def sync_ids(ctx: commands.Context):
+async def run_id_sync(guild: discord.Guild, send):
     """
     サーバーメンバーのDiscordニックネームとスプレッドシートの「名前（本名）」を
-    自動で突き合わせ、一致した分だけDiscordIDをシートに書き込む管理者向けコマンド。
-    """
-    await ctx.send("Discordメンバーとスプレッドシートを突き合わせています…（少し時間がかかります）")
+    自動で突き合わせ、一致した分だけDiscordIDをシートに書き込む。
 
-    guild_members = [(str(m.id), m.display_name) for m in ctx.guild.members if not m.bot]
+    send: 結果メッセージを送るための非同期関数（ctx.send や channel.send を渡す）。
+    「!id同期」コマンドと、新規メンバー参加時の自動実行の両方から呼び出される。
+    """
+    guild_members = [(str(m.id), m.display_name) for m in guild.members if not m.bot]
 
     try:
         result = await asyncio.to_thread(sheet_sync.sync_discord_ids, guild_members)
     except Exception as error:  # noqa: BLE001 - 管理者にそのままエラー内容を見せる
-        await ctx.send(f"エラーが発生しました：{error}")
+        await send(f"エラーが発生しました：{error}")
         return
 
     lines = [f"✅ {result['matched']}件、DiscordIDを自動入力しました。"]
@@ -126,14 +128,44 @@ async def sync_ids(ctx: commands.Context):
     message = "\n".join(lines)
 
     if len(message) <= 1900:
-        await ctx.send(message)
+        await send(message)
     else:
         # Discordの1メッセージ2000文字制限を超える場合はテキストファイルで送る
         buffer = io.StringIO(message)
-        await ctx.send(
+        await send(
             "結果が長くなったのでファイルに出力しました。",
             file=discord.File(fp=buffer, filename="id同期結果.txt"),
         )
+
+
+@bot.command(name="id同期")
+@commands.has_permissions(administrator=True)
+async def sync_ids(ctx: commands.Context):
+    """管理者がチャンネルで「!id同期」と打った時に手動で実行するコマンド。"""
+    await ctx.send("Discordメンバーとスプレッドシートを突き合わせています…（少し時間がかかります）")
+    await run_id_sync(ctx.guild, ctx.send)
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    """
+    新しいメンバーがサーバーに参加したら、自動で「id同期」を実行する。
+    結果は ID_SYNC_LOG_CHANNEL_NAME で指定したチャンネルに投稿する
+    （チャンネルが見つからない場合はコンソールログにのみ出力する）。
+    """
+    guild = member.guild
+    channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
+
+    async def send(*args, **kwargs):
+        if channel is not None:
+            await channel.send(*args, **kwargs)
+        else:
+            print(f"「{ID_SYNC_LOG_CHANNEL_NAME}」チャンネルが見つからないため、id同期の結果を送信できませんでした。")
+
+    if channel is not None:
+        await channel.send(f"👋 {member.mention} さんが参加しました。DiscordIDの自動突き合わせを行います…")
+
+    await run_id_sync(guild, send)
 
 
 async def post_matching_room_link():
