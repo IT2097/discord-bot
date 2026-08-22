@@ -27,7 +27,15 @@ from google.oauth2.service_account import Credentials
 # --- 設定（必要に応じて変更してください） ---
 HEADER_DISCORD_ID = "DiscordID"
 HEADER_NAME = "名前（本名）"
+HEADER_URL_1 = "URL①"
+HEADER_URL_2 = "URL②"
+HEADER_URL_3 = "URL③"
 CACHE_SECONDS = 300  # スプレッドシートを毎回読みに行かず、5分間だけ結果をキャッシュする
+
+# get_all_records() に明示的に渡す想定ヘッダー。
+# これを渡すことで、他の列の見出しが空欄・重複していてもエラーにならない
+# （逆にここに書いた列の見出しは、スプレッドシート上で必ず一致させる必要がある）。
+_EXPECTED_HEADERS = [HEADER_DISCORD_ID, HEADER_NAME, HEADER_URL_1, HEADER_URL_2, HEADER_URL_3]
 
 _SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -53,6 +61,7 @@ def _get_client():
 
     import json
 
+    # strict=False: 環境変数への貼り付け時に生の改行が混入していても許容する
     info = json.loads(raw_json, strict=False)
     creds = Credentials.from_service_account_info(info, scopes=_SCOPES)
     return gspread.authorize(creds)
@@ -67,7 +76,9 @@ def _fetch_members_from_sheet():
 
     client = _get_client()
     sheet = client.open_by_key(spreadsheet_id).worksheet(sheet_name)
-    rows = sheet.get_all_records()  # 1行目をヘッダーとして辞書のリストを取得
+    # expected_headers を渡すことで、他の列の見出しが空欄・重複していても
+    # エラーにならないようにする（1行目をヘッダーとして辞書のリストを取得）
+    rows = sheet.get_all_records(expected_headers=_EXPECTED_HEADERS)
 
     members = []
     seen_ids = set()
@@ -85,7 +96,16 @@ def _fetch_members_from_sheet():
             continue
 
         seen_ids.add(discord_id)
-        members.append({"discord_id": discord_id, "name": name})
+
+        # 空欄のURLは除外し、入力済みのものだけをリストにする
+        urls = [
+            str(row.get(HEADER_URL_1, "")).strip(),
+            str(row.get(HEADER_URL_2, "")).strip(),
+            str(row.get(HEADER_URL_3, "")).strip(),
+        ]
+        urls = [url for url in urls if url]
+
+        members.append({"discord_id": discord_id, "name": name, "urls": urls})
 
     return members
 
