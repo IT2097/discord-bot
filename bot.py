@@ -28,6 +28,9 @@ WEB_APP_URL = os.getenv("WEB_APP_URL")
 # 新規メンバー参加時に「id同期」の結果を投稿するチャンネル名
 ID_SYNC_LOG_CHANNEL_NAME = os.getenv("ID_SYNC_LOG_CHANNEL_NAME", "id同期ログ")
 
+# DMが送れないメンバーのために、本名登録ボタンを常設しておくチャンネル名
+NAME_REGISTER_CHANNEL_NAME = os.getenv("NAME_REGISTER_CHANNEL_NAME", "名前登録")
+
 
 def run_coro(coro, timeout: int = 15):
     """
@@ -146,14 +149,105 @@ async def sync_ids(ctx: commands.Context):
     await run_id_sync(ctx.guild, ctx.send)
 
 
+class NameModal(discord.ui.Modal, title="本名を登録"):
+    """
+    「名前を登録する」ボタンを押すと開くフォーム。姓・名を入力してもらい、
+    サーバー上のニックネームに反映させたうえでid同期を実行する。
+    """
+
+    last_name = discord.ui.TextInput(label="姓", placeholder="例：山田", max_length=20)
+    first_name = discord.ui.TextInput(label="名", placeholder="例：太郎", max_length=20)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        guild_id = os.getenv("GUILD_ID")
+        if not guild_id:
+            await interaction.followup.send(
+                "サーバー設定（GUILD_ID）が未設定のため、登録できませんでした。管理者に連絡してください。",
+                ephemeral=True,
+            )
+            return
+
+        guild = bot.get_guild(int(guild_id))
+        if guild is None:
+            await interaction.followup.send(
+                "サーバー情報が取得できませんでした。管理者に連絡してください。",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            member = await guild.fetch_member(interaction.user.id)
+        except discord.NotFound:
+            await interaction.followup.send(
+                "サーバーのメンバーとして確認できませんでした。サーバーに参加してから再度お試しください。",
+                ephemeral=True,
+            )
+            return
+
+        # スプレッドシートの「名前（本名）」列の書式（全角スペース区切り）に合わせる
+        full_name = f"{self.last_name.value.strip()}\u3000{self.first_name.value.strip()}"
+
+        try:
+            await member.edit(nick=full_name)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Botに「ニックネームの管理」権限がないため、名前を変更できませんでした。管理者に連絡してください。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"「{full_name}」として登録しました！会員情報と自動で突き合わせています…",
+            ephemeral=True,
+        )
+
+        channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
+
+        async def send(*args, **kwargs):
+            if channel is not None:
+                await channel.send(*args, **kwargs)
+
+        await run_id_sync(guild, send)
+
+
+class NameRegisterView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="名前を登録する",
+        style=discord.ButtonStyle.primary,
+        custom_id="persistent_name_register_button",
+    )
+    async def register(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(NameModal())
+
+
 @bot.event
 async def on_member_join(member: discord.Member):
     """
-    新しいメンバーがサーバーに参加したら、自動で「id同期」を実行する。
-    結果は ID_SYNC_LOG_CHANNEL_NAME で指定したチャンネルに投稿する
-    （チャンネルが見つからない場合はコンソールログにのみ出力する）。
+    新しいメンバーがサーバーに参加したら、本名登録フォーム（DM）を送る。
+    DMが送れない場合は「名前登録」チャンネルでの登録を案内する。
+    あわせて自動で「id同期」も実行する（すでにシートに名前がある人を拾うため）。
     """
     guild = member.guild
+
+    try:
+        await member.send(
+            f"🎉 {guild.name} へようこそ！\n"
+            "会員情報と連携するために、まずは本名を登録してください。",
+            view=NameRegisterView(),
+        )
+    except discord.Forbidden:
+        # DMを閉じているユーザーには、サーバー内の「名前登録」チャンネルで案内する
+        register_channel = discord.utils.get(guild.text_channels, name=NAME_REGISTER_CHANNEL_NAME)
+        if register_channel is not None:
+            await register_channel.send(
+                f"{member.mention} さん、ようこそ！DMが送れなかったため、こちらから本名を登録してください👇"
+            )
+
     channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
 
     async def send(*args, **kwargs):
@@ -197,6 +291,32 @@ async def post_matching_room_link():
     await channel.send(f"🔗 会員情報の確認・マッチング申請はこちらから！\n{WEB_APP_URL}")
 
 
+async def post_name_register_button():
+    """
+    「名前登録」チャンネルに、本名登録ボタンを投稿する
+    （DMを受け取れないメンバーのための導線）。すでに投稿済みなら再投稿しない。
+    """
+    guild_id = os.getenv("GUILD_ID")
+
+    if not guild_id:
+        return
+
+    guild = bot.get_guild(int(guild_id))
+    if guild is None:
+        return
+
+    channel = discord.utils.get(guild.text_channels, name=NAME_REGISTER_CHANNEL_NAME)
+    if channel is None:
+        print(f"「{NAME_REGISTER_CHANNEL_NAME}」という名前のテキストチャンネルが見つかりませんでした。")
+        return
+
+    async for message in channel.history(limit=20):
+        if message.author.id == bot.user.id and message.components:
+            return  # すでに投稿済み
+
+    await channel.send("本名を登録するには、下のボタンを押してください👇", view=NameRegisterView())
+
+
 @bot.event
 async def on_ready():
     global bot_loop
@@ -204,9 +324,11 @@ async def on_ready():
 
     # Railway再起動後も既存ボタンを反応させる
     bot.add_view(MatchView())
+    bot.add_view(NameRegisterView())
     print(f"ログインしました: {bot.user}")
 
     await post_matching_room_link()
+    await post_name_register_button()
 
 
 def start_web_server():
