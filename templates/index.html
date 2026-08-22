@@ -37,6 +37,14 @@
           </div>
         </div>
 
+        {% if member.urls %}
+        <div class="urls">
+          {% for url in member.urls %}
+            <a class="url-link" href="{{ url }}" target="_blank" rel="noopener noreferrer">🔗 リンク{{ loop.index }}</a>
+          {% endfor %}
+        </div>
+        {% endif %}
+
         {% if member.discord_id in pending %}
           <button class="request-btn" disabled>返信待ちです</button>
         {% else %}
