@@ -38,7 +38,7 @@ def _get_write_client():
     if not raw_json:
         raise RuntimeError("環境変数 GOOGLE_SERVICE_ACCOUNT_JSON が設定されていません。")
 
-    info = json.loads(raw_json)
+    info = json.loads(raw_json, strict=False)
     creds = Credentials.from_service_account_info(info, scopes=_WRITE_SCOPES)
     return gspread.authorize(creds)
 
