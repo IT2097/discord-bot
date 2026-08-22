@@ -149,6 +149,34 @@ h1 {
 
 .dot.pending { background: var(--status-pending); }
 
+/* --- 会員のURLリンク --- */
+.urls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.url-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--surface-hover);
+  border: 1px solid var(--border);
+  color: var(--accent-soft);
+  font-size: 12px;
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.url-link:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
 .request-btn {
   appearance: none;
   border: none;
@@ -281,5 +309,5 @@ h1 {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .card, .request-btn, .discord-btn, #toast { transition: none; }
+  .card, .url-link, .request-btn, .discord-btn, #toast { transition: none; }
 }
