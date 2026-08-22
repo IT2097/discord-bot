@@ -6,9 +6,18 @@ Discordサーバーのメンバー一覧と、スプレッドシートの「名�
 - サービスアカウントに、このスプレッドシートを「編集者」権限で共有していること
   （読み取り専用の閲覧権限では書き込みができません）
 
+【マッチングの考え方】
+シートの「名前（本名）」はスペース区切りで「姓　名」のように入っている想定です。
+Discordの表示名（ニックネーム）が完全に一致していなくても、姓・名の両方が
+表示名の中に含まれていれば同一人物とみなしてマッチングします
+（例：シート「山田　太郎」、Discord表示名「山田 太郎（東京）」でもマッチする）。
+これにより、絵文字や肩書きなどの装飾がニックネームに付いていても拾えるように
+しています。ただし該当する候補が複数人いる場合は、誤爆を避けるため
+自動入力せずスキップします（手動確認が必要）。
+
 【安全設計】
 - すでにDiscordIDが入力済みのセルは絶対に上書きしません（空のセルにしか書き込みません）
-- 同じ名前のDiscordメンバーが複数いる場合は、誤爆を避けるため自動入力せずスキップします
+- 該当候補が複数人いる場合は、誤爆を避けるため自動入力せずスキップします
 - 一致しなかった分は「あとで確認してほしいリスト」として返します
 """
 
@@ -33,6 +42,45 @@ def _normalize(name: str) -> str:
     return name.replace("\u3000", "").replace(" ", "").strip()
 
 
+def _split_name_parts(name: str) -> list[str]:
+    """
+    「名前（本名）」を、スペース（全角/半角）区切りで姓・名などのパーツに分割する。
+    区切りが無ければ、名前全体を1つのパーツとして扱う。
+    """
+    normalized = name.replace("\u3000", " ")
+    parts = [_normalize(p) for p in normalized.split(" ") if p.strip()]
+    return parts if parts else [_normalize(name)]
+
+
+def _find_matching_discord_id(
+    sheet_name: str, guild_members: list[tuple[str, str]]
+) -> tuple[str | None, bool]:
+    """
+    sheet_name（姓・名などスペース区切り）の各パーツが、すべて含まれている
+    Discordメンバーを探す。
+
+    戻り値: (見つかったdiscord_id、または見つからなければNone, 複数人が該当したか)
+    """
+    parts = _split_name_parts(sheet_name)
+    if not parts:
+        return None, False
+
+    matched_ids: set[str] = set()
+
+    for discord_id, display_name in guild_members:
+        normalized_display = _normalize(display_name)
+        if not normalized_display:
+            continue
+        if all(part in normalized_display for part in parts):
+            matched_ids.add(discord_id)
+
+    if len(matched_ids) == 1:
+        return next(iter(matched_ids)), False
+    if len(matched_ids) > 1:
+        return None, True
+    return None, False
+
+
 def _get_write_client():
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw_json:
@@ -49,7 +97,7 @@ def sync_discord_ids(guild_members: list[tuple[str, str]]) -> dict:
 
     戻り値:
       matched               : 自動入力した件数
-      ambiguous_names       : 同名が複数いたためスキップした名前
+      ambiguous_names       : 候補が複数人いたためスキップした名前
       unmatched_sheet_names : シートにあるがDiscordで一致しなかった名前
       unmatched_discord_names: Discordにいるがシートで一致しなかった表示名
     """
@@ -74,22 +122,10 @@ def sync_discord_ids(guild_members: list[tuple[str, str]]) -> dict:
 
     all_values = sheet.get_all_values()
 
-    # 正規化した表示名 -> discord_id のマップを作成（同名が複数いたらambiguousとして除外）
-    name_to_id: dict[str, str] = {}
-    ambiguous_keys: set[str] = set()
-
-    for discord_id, display_name in guild_members:
-        key = _normalize(display_name)
-        if not key:
-            continue
-        if key in name_to_id and name_to_id[key] != discord_id:
-            ambiguous_keys.add(key)
-        else:
-            name_to_id[key] = discord_id
-
     updates = []
     used_discord_ids: set[str] = set()
-    matched_name_keys: set[str] = set()
+    matched_sheet_names: set[str] = set()
+    ambiguous_names: set[str] = set()
 
     for row_idx, row in enumerate(all_values[1:], start=2):  # 1行目はヘッダー
         existing_id = row[id_col - 1].strip() if len(row) >= id_col else ""
@@ -98,17 +134,18 @@ def sync_discord_ids(guild_members: list[tuple[str, str]]) -> dict:
         if existing_id or not sheet_name_value:
             continue  # 入力済み、または名前が空の行はスキップ
 
-        key = _normalize(sheet_name_value)
-        if key in ambiguous_keys:
+        discord_id, is_ambiguous = _find_matching_discord_id(sheet_name_value, guild_members)
+
+        if is_ambiguous:
+            ambiguous_names.add(sheet_name_value)
             continue
 
-        discord_id = name_to_id.get(key)
         if discord_id:
             updates.append(
                 {"range": gspread.utils.rowcol_to_a1(row_idx, id_col), "values": [[discord_id]]}
             )
             used_discord_ids.add(discord_id)
-            matched_name_keys.add(key)
+            matched_sheet_names.add(sheet_name_value)
 
     if updates:
         sheet.batch_update(updates)
@@ -120,7 +157,7 @@ def sync_discord_ids(guild_members: list[tuple[str, str]]) -> dict:
     }
 
     unmatched_sheet_names = sorted(
-        n for n in sheet_name_values if _normalize(n) not in matched_name_keys
+        n for n in sheet_name_values if n not in matched_sheet_names and n not in ambiguous_names
     )
 
     unmatched_discord_names = sorted(
@@ -131,7 +168,7 @@ def sync_discord_ids(guild_members: list[tuple[str, str]]) -> dict:
 
     return {
         "matched": len(updates),
-        "ambiguous_names": sorted(ambiguous_keys),
+        "ambiguous_names": sorted(ambiguous_names),
         "unmatched_sheet_names": unmatched_sheet_names,
         "unmatched_discord_names": unmatched_discord_names,
     }
