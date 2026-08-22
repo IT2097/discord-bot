@@ -53,7 +53,7 @@ def _get_client():
 
     import json
 
-    info = json.loads(raw_json)
+    info = json.loads(raw_json, strict=False)
     creds = Credentials.from_service_account_info(info, scopes=_SCOPES)
     return gspread.authorize(creds)
 
