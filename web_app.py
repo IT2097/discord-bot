@@ -26,7 +26,7 @@ GUILD_ID = os.getenv("GUILD_ID")
 
 def create_app(bot, run_coro):
     """
-    bot: discord.ext.commands.Bot のインスタンス（DM送信などに使う）
+    bot: discord.ext.commands.Bot のインスタンス（承認チャンネルへの投稿などに使う）
     run_coro: Botのイベントループ上でコルーチンを実行し、結果を返すヘルパー関数
               （Flaskは別スレッドで動いているため、Bot側の処理はこれ経由で呼び出す）
     """
@@ -168,7 +168,7 @@ def create_app(bot, run_coro):
             return {"ok": False, "message": "この相手にはすでに申請中です。"}, 409
 
         try:
-            run_coro(_send_dm(bot, my_id, target_id, request_id))
+            run_coro(_notify_match_request(bot, my_id, target_id, request_id))
         except Exception as error:  # noqa: BLE001
             match_store.resolve_request(request_id)
             return {"ok": False, "message": f"申請の送信に失敗しました：{error}"}, 500
@@ -189,7 +189,7 @@ async def _is_guild_member(bot, discord_id: str) -> bool:
         return False
 
 
-async def _send_dm(bot, requester_id: str, target_id: str, request_id: str):
+async def _notify_match_request(bot, requester_id: str, target_id: str, request_id: str):
     import match_views
 
-    await match_views.send_match_request_dm(bot, requester_id, target_id, request_id)
+    await match_views.send_match_request_to_channel(bot, requester_id, target_id, request_id)
