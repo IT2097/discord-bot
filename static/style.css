@@ -103,7 +103,15 @@ h1 {
 .card-top {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 12px;
+}
+
+.identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
 }
 
 .avatar {
@@ -139,6 +147,72 @@ h1 {
   margin-top: 2px;
 }
 
+.meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.expand-btn {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.expand-btn:hover { border-color: var(--accent); color: var(--text); }
+
+.expand-btn.open {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.details {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.details[hidden] { display: none; }
+
+.business {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+}
+
+.business-type {
+  display: inline-block;
+  align-self: flex-start;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  color: var(--accent-soft);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.business-content {
+  color: var(--text);
+}
+
 .dot {
   width: 8px;
   height: 8px;
@@ -148,6 +222,7 @@ h1 {
 }
 
 .dot.pending { background: var(--status-pending); }
+.dot.matched { background: var(--accent); }
 
 /* --- 会員のURLリンク --- */
 .urls {
@@ -309,5 +384,5 @@ h1 {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .card, .url-link, .request-btn, .discord-btn, #toast { transition: none; }
+  .card, .url-link, .expand-btn, .request-btn, .discord-btn, #toast { transition: none; }
 }
