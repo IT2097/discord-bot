@@ -5,14 +5,15 @@ Googleスプレッドシートから会員一覧を読み込むモジュール�
 1行目をヘッダー行として、以下の列名を想定しています（列の順番は自由）。
   - DiscordID   : 会員のDiscordユーザーID（数字のみ。開発者モードでコピーしたID）
   - 名前（本名） : Webページ上に表示する名前
+  - 年齢・性別・都道府県・市町村・業種・事業 / 活動内容 : 一覧に表示する属性情報
 
-ヘッダー名が違う場合は下の HEADER_DISCORD_ID / HEADER_NAME を書き換えてください。
+ヘッダー名が違う場合は下の HEADER_* 定数を書き換えてください。
 
 【1人が複数行にまたがるシートへの対応】
 「事業/活動内容ごとに行が分かれていて、同じ人が複数行に登場する」形式のシート
-（例: 渡辺大智さんが4行に分かれている等）にも対応しています。
-DiscordIDは同じ人のどれか1行にだけ入力すればOKで、同じDiscordIDを持つ行は
-自動的に1人分として1件にまとめられます（重複除去）。
+（例: 渡辺大智さんが4行に分かれている等）に対応しています。
+DiscordIDは同じ人のどれか1行にだけ入力すればOKで、「名前（本名）」が同じ行は
+自動的に1人分としてまとめられ、業種・事業/活動内容はまとめて一覧で保持されます。
 """
 
 from __future__ import annotations
@@ -27,6 +28,12 @@ from google.oauth2.service_account import Credentials
 # --- 設定（必要に応じて変更してください） ---
 HEADER_DISCORD_ID = "DiscordID"
 HEADER_NAME = "名前（本名）"
+HEADER_AGE = "年齢"
+HEADER_GENDER = "性別"
+HEADER_PREFECTURE = "都道府県"
+HEADER_CITY = "市町村"
+HEADER_BUSINESS_TYPE = "業種"
+HEADER_BUSINESS_CONTENT = "事業 / 活動内容"
 HEADER_URL_1 = "URL①"
 HEADER_URL_2 = "URL②"
 HEADER_URL_3 = "URL③"
@@ -35,7 +42,19 @@ CACHE_SECONDS = 300  # スプレッドシートを毎回読みに行かず、5�
 # get_all_records() に明示的に渡す想定ヘッダー。
 # これを渡すことで、他の列の見出しが空欄・重複していてもエラーにならない
 # （逆にここに書いた列の見出しは、スプレッドシート上で必ず一致させる必要がある）。
-_EXPECTED_HEADERS = [HEADER_DISCORD_ID, HEADER_NAME, HEADER_URL_1, HEADER_URL_2, HEADER_URL_3]
+_EXPECTED_HEADERS = [
+    HEADER_DISCORD_ID,
+    HEADER_NAME,
+    HEADER_AGE,
+    HEADER_GENDER,
+    HEADER_PREFECTURE,
+    HEADER_CITY,
+    HEADER_BUSINESS_TYPE,
+    HEADER_BUSINESS_CONTENT,
+    HEADER_URL_1,
+    HEADER_URL_2,
+    HEADER_URL_3,
+]
 
 _SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -80,32 +99,46 @@ def _fetch_members_from_sheet():
     # エラーにならないようにする（1行目をヘッダーとして辞書のリストを取得）
     rows = sheet.get_all_records(expected_headers=_EXPECTED_HEADERS)
 
-    members = []
-    seen_ids = set()
+    # 「名前（本名）」をキーに、複数行にまたがる情報を1人分にまとめる。
+    # DiscordIDは同じ人のどこか1行にだけ入っていればよいので、
+    # 先に名前でグルーピングしてから、最後にDiscordIDが無い人だけ除外する。
+    members_by_name: dict[str, dict] = {}
 
     for row in rows:
-        discord_id = str(row.get(HEADER_DISCORD_ID, "")).strip()
         name = str(row.get(HEADER_NAME, "")).strip()
+        if not name:
+            continue  # 名前が空の行（見出しだけの行など）はスキップ
 
-        if not discord_id or not name:
-            # DiscordIDか名前が空の行はスキップ（事業内容だけの行、未入力の行など）
-            continue
+        entry = members_by_name.get(name)
+        if entry is None:
+            entry = {
+                "name": name,
+                "discord_id": "",
+                "age": str(row.get(HEADER_AGE, "")).strip(),
+                "gender": str(row.get(HEADER_GENDER, "")).strip(),
+                "prefecture": str(row.get(HEADER_PREFECTURE, "")).strip(),
+                "city": str(row.get(HEADER_CITY, "")).strip(),
+                "businesses": [],
+                "urls": [],
+            }
+            members_by_name[name] = entry
 
-        if discord_id in seen_ids:
-            # 同じ人の別の事業/活動の行なのでスキップ（1人1件にまとめる）
-            continue
+        discord_id = str(row.get(HEADER_DISCORD_ID, "")).strip()
+        if discord_id and not entry["discord_id"]:
+            entry["discord_id"] = discord_id
 
-        seen_ids.add(discord_id)
+        business_type = str(row.get(HEADER_BUSINESS_TYPE, "")).strip()
+        business_content = str(row.get(HEADER_BUSINESS_CONTENT, "")).strip()
+        if business_type or business_content:
+            entry["businesses"].append({"type": business_type, "content": business_content})
 
-        # 空欄のURLは除外し、入力済みのものだけをリストにする
-        urls = [
-            str(row.get(HEADER_URL_1, "")).strip(),
-            str(row.get(HEADER_URL_2, "")).strip(),
-            str(row.get(HEADER_URL_3, "")).strip(),
-        ]
-        urls = [url for url in urls if url]
+        for header in (HEADER_URL_1, HEADER_URL_2, HEADER_URL_3):
+            url = str(row.get(header, "")).strip()
+            if url and url not in entry["urls"]:
+                entry["urls"].append(url)
 
-        members.append({"discord_id": discord_id, "name": name, "urls": urls})
+    # DiscordIDが1行も見つからなかった人は、Discordと紐付けできないため一覧から除外する
+    members = [entry for entry in members_by_name.values() if entry["discord_id"]]
 
     return members
 
