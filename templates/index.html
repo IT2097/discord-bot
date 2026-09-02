@@ -24,18 +24,36 @@
       {% for member in members %}
       <div class="card">
         <div class="card-top">
-          <div class="avatar">{{ member.name[0] }}</div>
-          <div class="name-block">
-            <div class="name">{{ member.name }}</div>
-            <div class="status">
-              {% if member.discord_id in pending %}
-                <span class="dot pending"></span> 申請中
-              {% else %}
-                <span class="dot"></span> 申請可能
-              {% endif %}
+          <div class="identity">
+            <div class="avatar">{{ member.name[0] }}</div>
+            <div class="name-block">
+              <div class="name">{{ member.name }}</div>
+              <div class="meta">{{ [member.age, member.gender, (member.prefecture ~ member.city)] | select | join(' ・ ') }}</div>
             </div>
           </div>
+          {% if member.businesses %}
+          <button class="expand-btn" type="button" aria-label="業種・事業内容を表示">+</button>
+          {% endif %}
         </div>
+
+        <div class="status">
+          {% if member.discord_id in pending %}
+            <span class="dot pending"></span> 申請中
+          {% else %}
+            <span class="dot"></span> 申請可能
+          {% endif %}
+        </div>
+
+        {% if member.businesses %}
+        <div class="details" hidden>
+          {% for biz in member.businesses %}
+          <div class="business">
+            {% if biz.type %}<span class="business-type">{{ biz.type }}</span>{% endif %}
+            {% if biz.content %}<span class="business-content">{{ biz.content }}</span>{% endif %}
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
 
         {% if member.urls %}
         <div class="urls">
@@ -70,6 +88,24 @@
       clearTimeout(toastTimer);
       toastTimer = setTimeout(() => toast.classList.remove('show'), 3200);
     }
+
+    document.querySelectorAll('.expand-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const details = btn.closest('.card').querySelector('.details');
+        if (!details) return;
+
+        const isHidden = details.hasAttribute('hidden');
+        if (isHidden) {
+          details.removeAttribute('hidden');
+          btn.textContent = '−';
+          btn.classList.add('open');
+        } else {
+          details.setAttribute('hidden', '');
+          btn.textContent = '+';
+          btn.classList.remove('open');
+        }
+      });
+    });
 
     document.querySelectorAll('.request-btn[data-target]').forEach((btn) => {
       btn.addEventListener('click', async () => {
