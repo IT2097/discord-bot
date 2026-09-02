@@ -37,7 +37,9 @@
         </div>
 
         <div class="status">
-          {% if member.discord_id in pending %}
+          {% if member.discord_id in matched %}
+            <span class="dot matched"></span> マッチング中
+          {% elif member.discord_id in pending %}
             <span class="dot pending"></span> 申請中
           {% else %}
             <span class="dot"></span> 申請可能
@@ -63,7 +65,9 @@
         </div>
         {% endif %}
 
-        {% if member.discord_id in pending %}
+        {% if member.discord_id in matched %}
+          <button class="request-btn" disabled>マッチング中</button>
+        {% elif member.discord_id in pending %}
           <button class="request-btn" disabled>返信待ちです</button>
         {% else %}
           <button class="request-btn" data-target="{{ member.discord_id }}">マッチング希望を送る</button>
