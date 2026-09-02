@@ -164,3 +164,11 @@ def find_member_name(discord_id: str) -> str | None:
         if member["discord_id"] == str(discord_id):
             return member["name"]
     return None
+
+
+def find_member(discord_id: str) -> dict | None:
+    """DiscordIDからプロフィール全体（名前・年齢・性別・都道府県・市町村・業種等）を引く。"""
+    for member in get_members():
+        if member["discord_id"] == str(discord_id):
+            return member
+    return None

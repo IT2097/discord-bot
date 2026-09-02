@@ -7,11 +7,39 @@ import os
 import discord
 
 import match_store
+import sheets_client
 
 GUILD_ID = os.getenv("GUILD_ID")
 
 # マッチング申請の承認メッセージを投稿するテキストチャンネル名
 APPROVAL_CHANNEL_NAME = os.getenv("APPROVAL_CHANNEL_NAME", "承認")
+
+
+def _format_profile(member: dict) -> str:
+    """
+    スプレッドシートのプロフィール情報（名前・年齢・性別・都道府県・市町村・
+    業種・事業/活動内容）を、DMやチャンネル投稿用のテキストに整形する。
+    """
+    lines = [f"📇 {member['name']} さんのプロフィールです"]
+
+    if member.get("age"):
+        lines.append(f"年齢：{member['age']}")
+    if member.get("gender"):
+        lines.append(f"性別：{member['gender']}")
+    if member.get("prefecture"):
+        lines.append(f"都道府県：{member['prefecture']}")
+    if member.get("city"):
+        lines.append(f"市町村：{member['city']}")
+
+    for biz in member.get("businesses", []):
+        biz_type = biz.get("type", "")
+        biz_content = biz.get("content", "")
+        if biz_type:
+            lines.append(f"業種：{biz_type}")
+        if biz_content:
+            lines.append(f"事業/活動内容：{biz_content}")
+
+    return "\n".join(lines)
 
 
 async def create_match_channel(
@@ -42,6 +70,16 @@ async def create_match_channel(
     )
 
     await channel.send(f"{member_a.mention} と {member_b.mention} のマッチングルームです！")
+
+    # お互いのプロフィール（スプレッドシートの情報）を1通ずつ投稿する
+    for member in (member_a, member_b):
+        try:
+            profile = sheets_client.find_member(str(member.id))
+        except Exception:  # noqa: BLE001 - シート取得に失敗してもルーム作成自体は継続する
+            profile = None
+        if profile:
+            await channel.send(_format_profile(profile))
+
     return channel
 
 
@@ -132,6 +170,8 @@ class MatchApproveView(discord.ui.View):
             f"マッチングが成立しました！ {channel.mention} をご確認ください。",
             ephemeral=True,
         )
+
+        match_store.mark_matched(request["requester_id"], request["target_id"])
 
         try:
             await requester.send(

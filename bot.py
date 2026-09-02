@@ -31,6 +31,23 @@ ID_SYNC_LOG_CHANNEL_NAME = os.getenv("ID_SYNC_LOG_CHANNEL_NAME", "id同期ログ
 # DMが送れないメンバーのために、本名登録ボタンを常設しておくチャンネル名
 NAME_REGISTER_CHANNEL_NAME = os.getenv("NAME_REGISTER_CHANNEL_NAME", "名前登録")
 
+# 参加直後に自動付与し、本名登録が終わったら自動で外すロール名
+# （このロールには、事前にDiscord側で「名前登録チャンネル以外は見られない」
+# 権限設定をしておく必要があります）
+UNVERIFIED_ROLE_NAME = os.getenv("UNVERIFIED_ROLE_NAME", "未登録")
+
+
+async def _remove_unverified_role(member: discord.Member):
+    """本名登録が完了したメンバーから「未登録」ロールを外す。"""
+    role = discord.utils.get(member.guild.roles, name=UNVERIFIED_ROLE_NAME)
+    if role is None:
+        return
+    if role in member.roles:
+        try:
+            await member.remove_roles(role, reason="本名登録が完了したため")
+        except discord.Forbidden:
+            print(f"「{UNVERIFIED_ROLE_NAME}」ロールを外す権限がBotにありません。")
+
 
 def run_coro(coro, timeout: int = 15):
     """
@@ -203,6 +220,9 @@ class NameModal(discord.ui.Modal, title="本名を登録"):
             ephemeral=True,
         )
 
+        # 名前登録が完了したので、サーバーの他のチャンネルを見られるようにする
+        await _remove_unverified_role(member)
+
         channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
 
         async def send(*args, **kwargs):
@@ -228,11 +248,21 @@ class NameRegisterView(discord.ui.View):
 @bot.event
 async def on_member_join(member: discord.Member):
     """
-    新しいメンバーがサーバーに参加したら、本名登録フォーム（DM）を送る。
-    DMが送れない場合は「名前登録」チャンネルでの登録を案内する。
-    あわせて自動で「id同期」も実行する（すでにシートに名前がある人を拾うため）。
+    新しいメンバーがサーバーに参加したら、
+    1. 「未登録」ロールを付与する（名前登録が終わるまで他のチャンネルを見せないため）
+    2. 本名登録フォーム（DM）を送る。DMが送れない場合は「名前登録」チャンネルで案内する
+    3. 自動で「id同期」も実行する（すでにシートに名前がある人を拾うため）
     """
     guild = member.guild
+
+    unverified_role = discord.utils.get(guild.roles, name=UNVERIFIED_ROLE_NAME)
+    if unverified_role is not None:
+        try:
+            await member.add_roles(unverified_role, reason="本名登録が完了するまでの制限用")
+        except discord.Forbidden:
+            print(f"「{UNVERIFIED_ROLE_NAME}」ロールを付与する権限がBotにありません。")
+    else:
+        print(f"「{UNVERIFIED_ROLE_NAME}」という名前のロールが見つかりませんでした。")
 
     try:
         await member.send(

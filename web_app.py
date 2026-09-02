@@ -63,6 +63,7 @@ def create_app(bot, run_coro):
             return render_template("error.html", message=f"会員一覧の取得に失敗しました：{error}")
 
         pending = match_store.pending_targets_for(my_id)
+        matched = match_store.matched_targets_for(my_id)
 
         other_members = [m for m in members if m["discord_id"] != str(my_id)]
 
@@ -71,6 +72,7 @@ def create_app(bot, run_coro):
             my_name=my_name,
             members=other_members,
             pending=pending,
+            matched=matched,
         )
 
     @app.route("/login")
