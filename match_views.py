@@ -1,5 +1,5 @@
 """
-マッチング申請の承認・拒否をDM上で行うためのViewと、
+マッチング申請の承認・拒否を「承認」チャンネルで行うためのViewと、
 プライベートなマッチングルーム作成処理をまとめたモジュール。
 """
 
@@ -9,6 +9,9 @@ import discord
 import match_store
 
 GUILD_ID = os.getenv("GUILD_ID")
+
+# マッチング申請の承認メッセージを投稿するテキストチャンネル名
+APPROVAL_CHANNEL_NAME = os.getenv("APPROVAL_CHANNEL_NAME", "承認")
 
 
 async def create_match_channel(
@@ -44,13 +47,15 @@ async def create_match_channel(
 
 class MatchApproveView(discord.ui.View):
     """
-    DMで送られる「承認する / 断る」ボタン。
+    「承認」チャンネルに投稿される「承認する / 断る」ボタン。
     request_id を持たせておき、押されたタイミングで match_store から
     申請内容（誰から誰への申請か）を引く。
+
+    チャンネルに投稿されるため、押せるのは申請の宛先本人のみに制限する。
     """
 
     def __init__(self, bot: discord.Client, request_id: str):
-        # 承認待ちのままDMに残っていてもよいようタイムアウトなしにしている
+        # 承認待ちのままチャンネルに残っていてもよいようタイムアウトなしにしている
         super().__init__(timeout=None)
         self.bot = bot
         self.request_id = request_id
@@ -60,19 +65,31 @@ class MatchApproveView(discord.ui.View):
             item.disabled = True
         await interaction.message.edit(view=self)
 
+    async def _check_is_target(self, interaction: discord.Interaction, request: dict) -> bool:
+        if str(interaction.user.id) != request["target_id"]:
+            await interaction.response.send_message(
+                "この申請はあなた宛てではないため、操作できません。", ephemeral=True
+            )
+            return False
+        return True
+
     @discord.ui.button(label="承認する", style=discord.ButtonStyle.success, custom_id="match_approve")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-
-        request = match_store.resolve_request(self.request_id)
-        await self._disable_all(interaction)
+        request = match_store.get_request(self.request_id)
 
         if request is None:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "この申請はすでに期限切れ、またはキャンセルされています。",
                 ephemeral=True,
             )
             return
+
+        if not await self._check_is_target(interaction, request):
+            return
+
+        await interaction.response.defer()
+        match_store.resolve_request(self.request_id)
+        await self._disable_all(interaction)
 
         if not GUILD_ID:
             await interaction.followup.send(
@@ -125,14 +142,25 @@ class MatchApproveView(discord.ui.View):
 
     @discord.ui.button(label="断る", style=discord.ButtonStyle.danger, custom_id="match_reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
+        request = match_store.get_request(self.request_id)
 
-        request = match_store.resolve_request(self.request_id)
+        if request is None:
+            await interaction.response.send_message(
+                "この申請はすでに期限切れ、またはキャンセルされています。",
+                ephemeral=True,
+            )
+            return
+
+        if not await self._check_is_target(interaction, request):
+            return
+
+        await interaction.response.defer()
+        match_store.resolve_request(self.request_id)
         await self._disable_all(interaction)
 
         await interaction.followup.send("申請を断りました。", ephemeral=True)
 
-        if request is None or not GUILD_ID:
+        if not GUILD_ID:
             return
 
         guild = self.bot.get_guild(int(GUILD_ID))
@@ -146,8 +174,11 @@ class MatchApproveView(discord.ui.View):
             pass
 
 
-async def send_match_request_dm(bot: discord.Client, requester_id: str, target_id: str, request_id: str):
-    """Webページからのマッチング申請を、相手にDMで通知する。"""
+async def send_match_request_to_channel(bot: discord.Client, requester_id: str, target_id: str, request_id: str):
+    """
+    Webページからのマッチング申請を、「承認」チャンネルに投稿して通知する。
+    申請の宛先ユーザーをメンションし、承認/断るボタンを添える。
+    """
     if not GUILD_ID:
         raise RuntimeError("環境変数 GUILD_ID が設定されていません。")
 
@@ -155,11 +186,15 @@ async def send_match_request_dm(bot: discord.Client, requester_id: str, target_i
     if guild is None:
         raise RuntimeError("Botが指定のサーバーに参加していないか、GUILD_IDが誤っています。")
 
+    channel = discord.utils.get(guild.text_channels, name=APPROVAL_CHANNEL_NAME)
+    if channel is None:
+        raise RuntimeError(f"「{APPROVAL_CHANNEL_NAME}」という名前のテキストチャンネルが見つかりません。")
+
     requester = await guild.fetch_member(int(requester_id))
     target = await guild.fetch_member(int(target_id))
 
     view = MatchApproveView(bot, request_id)
-    await target.send(
-        f"💌 **{requester.display_name}** さんからマッチング希望です！マッチングしますか？",
+    await channel.send(
+        f"{target.mention}\n{requester.display_name} さんからマッチの依頼が来ました！承認しますか？",
         view=view,
     )
