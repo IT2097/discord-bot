@@ -20,9 +20,35 @@
     </div>
 
     {% if members %}
-    <div class="grid">
+    <div class="filters">
+      <input type="text" id="keyword-search" class="filter-input" placeholder="キーワードで検索（名前・業種・事業内容）">
+      <select id="filter-age" class="filter-select">
+        <option value="">年齢：すべて</option>
+        {% for age in ages %}
+        <option value="{{ age }}">{{ age }}</option>
+        {% endfor %}
+      </select>
+      <select id="filter-gender" class="filter-select">
+        <option value="">性別：すべて</option>
+        {% for gender in genders %}
+        <option value="{{ gender }}">{{ gender }}</option>
+        {% endfor %}
+      </select>
+      <select id="filter-prefecture" class="filter-select">
+        <option value="">都道府県：すべて</option>
+        {% for prefecture in prefectures %}
+        <option value="{{ prefecture }}">{{ prefecture }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="grid" id="member-grid">
       {% for member in members %}
-      <div class="card">
+      <div class="card"
+           data-search="{{ member.search_blob }}"
+           data-age="{{ member.age }}"
+           data-gender="{{ member.gender }}"
+           data-prefecture="{{ member.prefecture }}">
         <div class="card-top">
           <div class="identity">
             <div class="avatar">{{ member.name[0] }}</div>
@@ -75,6 +101,7 @@
       </div>
       {% endfor %}
     </div>
+    <p class="empty" id="filter-empty" hidden>条件に一致する会員が見つかりません。</p>
     {% else %}
       <p class="empty">表示できる会員がいません。</p>
     {% endif %}
@@ -92,6 +119,41 @@
       clearTimeout(toastTimer);
       toastTimer = setTimeout(() => toast.classList.remove('show'), 3200);
     }
+
+    const keywordInput = document.getElementById('keyword-search');
+    const ageSelect = document.getElementById('filter-age');
+    const genderSelect = document.getElementById('filter-gender');
+    const prefectureSelect = document.getElementById('filter-prefecture');
+    const memberCards = document.querySelectorAll('#member-grid .card');
+    const filterEmpty = document.getElementById('filter-empty');
+
+    function applyFilters() {
+      const keyword = keywordInput ? keywordInput.value.trim().toLowerCase() : '';
+      const age = ageSelect ? ageSelect.value : '';
+      const gender = genderSelect ? genderSelect.value : '';
+      const prefecture = prefectureSelect ? prefectureSelect.value : '';
+
+      let visibleCount = 0;
+
+      memberCards.forEach((card) => {
+        const matchesKeyword = !keyword || card.dataset.search.includes(keyword);
+        const matchesAge = !age || card.dataset.age === age;
+        const matchesGender = !gender || card.dataset.gender === gender;
+        const matchesPrefecture = !prefecture || card.dataset.prefecture === prefecture;
+
+        const visible = matchesKeyword && matchesAge && matchesGender && matchesPrefecture;
+        card.style.display = visible ? '' : 'none';
+        if (visible) visibleCount += 1;
+      });
+
+      if (filterEmpty) {
+        filterEmpty.hidden = visibleCount !== 0;
+      }
+    }
+
+    [keywordInput, ageSelect, genderSelect, prefectureSelect].forEach((el) => {
+      if (el) el.addEventListener('input', applyFilters);
+    });
 
     document.querySelectorAll('.expand-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
