@@ -67,12 +67,28 @@ def create_app(bot, run_coro):
 
         other_members = [m for m in members if m["discord_id"] != str(my_id)]
 
+        # クライアント側での検索・絞り込み用に、名前＋業種＋事業内容をまとめた
+        # 検索用テキストを各会員に持たせておく
+        for member in other_members:
+            business_text = " ".join(
+                f"{biz.get('type', '')} {biz.get('content', '')}"
+                for biz in member.get("businesses", [])
+            )
+            member["search_blob"] = f"{member['name']} {business_text}".strip().lower()
+
+        ages = sorted({m["age"] for m in other_members if m.get("age")})
+        genders = sorted({m["gender"] for m in other_members if m.get("gender")})
+        prefectures = sorted({m["prefecture"] for m in other_members if m.get("prefecture")})
+
         return render_template(
             "index.html",
             my_name=my_name,
             members=other_members,
             pending=pending,
             matched=matched,
+            ages=ages,
+            genders=genders,
+            prefectures=prefectures,
         )
 
     @app.route("/login")

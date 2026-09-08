@@ -258,8 +258,8 @@ class NameModal(discord.ui.Modal, title="本名を登録"):
             )
             return
 
-        # スプレッドシートの「名前（本名）」列の書式（全角スペース区切り）に合わせる
-        full_name = f"{self.last_name.value.strip()}\u3000{self.first_name.value.strip()}"
+        # ニックネームの表記は姓名の間に空白を入れない
+        full_name = f"{self.last_name.value.strip()}{self.first_name.value.strip()}"
 
         try:
             await member.edit(nick=full_name)
