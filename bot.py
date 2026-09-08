@@ -9,6 +9,7 @@ import discord
 from discord.ext import commands
 
 import match_views
+import match_records
 import sheet_sync
 import web_app
 
@@ -164,6 +165,60 @@ async def sync_ids(ctx: commands.Context):
     """管理者がチャンネルで「!id同期」と打った時に手動で実行するコマンド。"""
     await ctx.send("Discordメンバーとスプレッドシートを突き合わせています…（少し時間がかかります）")
     await run_id_sync(ctx.guild, ctx.send)
+
+
+@bot.command(name="マッチング復元")
+@commands.has_permissions(administrator=True)
+async def restore_matches(ctx: commands.Context):
+    """
+    既存の「2人だけが見えるプライベートなテキストチャンネル」をスキャンして、
+    マッチング履歴（match_records）にまだ記録されていないペアを書き戻す管理者向けコマンド。
+    今回の仕組みを導入する前に成立していたマッチングを拾い直すためのもの。
+    """
+    await ctx.send("既存のマッチングルームをスキャンしています…（少し時間がかかります）")
+
+    guild = ctx.guild
+    found_pairs: set[frozenset] = set()
+
+    for channel in guild.text_channels:
+        member_ids = []
+        default_denied = False
+
+        for target, overwrite in channel.overwrites.items():
+            if target == guild.default_role:
+                if overwrite.view_channel is False:
+                    default_denied = True
+                continue
+            if isinstance(target, discord.Member) and not target.bot:
+                if overwrite.view_channel is True:
+                    member_ids.append(str(target.id))
+
+        # 「@everyoneは見えない」かつ「個人が明示的に2人だけ見える」チャンネルを
+        # プライベートなマッチングルームとみなす
+        if default_denied and len(member_ids) == 2:
+            found_pairs.add(frozenset(member_ids))
+
+    if not found_pairs:
+        await ctx.send("それらしいプライベートルームは見つかりませんでした。")
+        return
+
+    added = 0
+    try:
+        existing_pairs = await asyncio.to_thread(match_records.get_all_matched_pairs)
+        for pair in found_pairs:
+            if pair in existing_pairs:
+                continue
+            member_a, member_b = tuple(pair)
+            await asyncio.to_thread(match_records.append_match, member_a, member_b)
+            added += 1
+    except Exception as error:  # noqa: BLE001 - 管理者にそのままエラー内容を見せる
+        await ctx.send(f"エラーが発生しました：{error}")
+        return
+
+    await ctx.send(
+        f"✅ プライベートルームを{len(found_pairs)}件検出し、"
+        f"うち{added}件を新たにマッチング履歴へ追加しました。"
+    )
 
 
 class NameModal(discord.ui.Modal, title="本名を登録"):
