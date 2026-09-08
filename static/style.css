@@ -77,6 +77,49 @@ h1 {
 
 .me a:hover { color: var(--text); }
 
+/* --- 検索・絞り込みバー --- */
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 24px;
+}
+
+.filter-input,
+.filter-select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.filter-input {
+  flex: 1 1 240px;
+  min-width: 180px;
+}
+
+.filter-input::placeholder { color: var(--text-muted); }
+
+.filter-select {
+  flex: 0 1 150px;
+  min-width: 130px;
+}
+
+.filter-select option {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.filter-input:focus,
+.filter-select:focus {
+  border-color: var(--accent);
+}
+
 /* --- 会員グリッド --- */
 .grid {
   display: grid;
@@ -384,5 +427,5 @@ h1 {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .card, .url-link, .expand-btn, .request-btn, .discord-btn, #toast { transition: none; }
+  .card, .url-link, .expand-btn, .filter-input, .filter-select, .request-btn, .discord-btn, #toast { transition: none; }
 }
