@@ -278,13 +278,8 @@ class NameModal(discord.ui.Modal, title="本名を登録"):
         # 名前登録が完了したので、サーバーの他のチャンネルを見られるようにする
         await _remove_unverified_role(member)
 
-        channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
-
-        async def send(*args, **kwargs):
-            if channel is not None:
-                await channel.send(*args, **kwargs)
-
-        await run_id_sync(guild, send)
+        # ニックネームの変更自体は on_member_update が検知して自動でid同期を実行するため、
+        # ここで重複して呼び出す必要はない
 
 
 class NameRegisterView(discord.ui.View):
@@ -343,6 +338,33 @@ async def on_member_join(member: discord.Member):
 
     if channel is not None:
         await channel.send(f"👋 {member.mention} さんが参加しました。DiscordIDの自動突き合わせを行います…")
+
+    await run_id_sync(guild, send)
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """
+    メンバーのニックネームが変更されたら、自動で「id同期」を実行する。
+    名前登録フォーム経由の変更・本人がDiscordの設定から手動で変更した場合の
+    どちらも検知する（ロールの変更など、ニックネーム以外の更新は対象外）。
+    """
+    if before.nick == after.nick:
+        return
+
+    guild = after.guild
+    channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
+
+    async def send(*args, **kwargs):
+        if channel is not None:
+            await channel.send(*args, **kwargs)
+        else:
+            print(f"「{ID_SYNC_LOG_CHANNEL_NAME}」チャンネルが見つからないため、id同期の結果を送信できませんでした。")
+
+    if channel is not None:
+        await channel.send(
+            f"✏️ {after.mention} さんのニックネームが変更されました。DiscordIDの自動突き合わせを行います…"
+        )
 
     await run_id_sync(guild, send)
 
