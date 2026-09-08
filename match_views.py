@@ -4,9 +4,11 @@
 """
 
 import os
+import asyncio
 import discord
 
 import match_store
+import match_records
 import sheets_client
 
 GUILD_ID = os.getenv("GUILD_ID")
@@ -172,6 +174,14 @@ class MatchApproveView(discord.ui.View):
         )
 
         match_store.mark_matched(request["requester_id"], request["target_id"])
+
+        try:
+            # スプレッドシートへの書き込みはブロッキング処理なので別スレッドで実行する
+            await asyncio.to_thread(
+                match_records.append_match, request["requester_id"], request["target_id"]
+            )
+        except Exception:  # noqa: BLE001 - 永続化に失敗してもマッチング自体は成立させる
+            print("マッチング履歴の永続化に失敗しました。")
 
         try:
             await requester.send(

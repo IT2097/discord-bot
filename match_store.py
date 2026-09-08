@@ -6,10 +6,11 @@
 あわせて、マッチングが成立したペアも記録し、Web側で「マッチング中」と
 表示してボタンを押せなくするために使います。
 
-シンプルにするためメモリ上（プロセス内の辞書）で管理しています。
-Railwayの再起動やデプロイでプロセスが再起動すると、承認待ち・成立済みの
-情報はどちらもリセットされます（＝再起動後は改めて申請し直せます）。
-より厳密に永続化したい場合はSQLite等への置き換えを検討してください。
+シンプルにするため、承認待ち中の状態はメモリ上（プロセス内の辞書）で管理しています。
+Railwayの再起動やデプロイでプロセスが再起動すると、承認待ちの情報はリセットされます
+（＝再起動後は改めて申請し直せます）。
+一方、マッチング成立済みのペアは match_records.py 経由でスプレッドシートにも
+永続化されるため、再起動後も「マッチング中」の判定は保たれます。
 """
 
 from __future__ import annotations
@@ -104,13 +105,27 @@ def mark_matched(user_a: str, user_b: str) -> None:
 
 
 def matched_targets_for(user_id: str) -> set[str]:
-    """指定したユーザーが、すでにマッチング成立済みの相手IDの集合を返す（Web側の表示用）。"""
+    """
+    指定したユーザーが、すでにマッチング成立済みの相手IDの集合を返す（Web側の表示用）。
+    プロセス内メモリの記録に加えて、match_records（スプレッドシート上の永続履歴）も
+    合わせて参照することで、Railway再起動後も判定できるようにしている。
+    """
+    import match_records  # 遅延importで循環参照を避ける
+
+    user_id = str(user_id)
+
     with _lock:
-        user_id = str(user_id)
-        others: set[str] = set()
-        for pair in _matched_pairs:
-            if user_id in pair:
-                other = next(iter(pair - {user_id}), None)
-                if other:
-                    others.add(other)
-        return others
+        pairs = set(_matched_pairs)
+
+    try:
+        pairs |= match_records.get_all_matched_pairs()
+    except Exception:  # noqa: BLE001 - シート側が一時的に取得できなくてもメモリの情報で表示は継続する
+        pass
+
+    others: set[str] = set()
+    for pair in pairs:
+        if user_id in pair:
+            other = next(iter(pair - {user_id}), None)
+            if other:
+                others.add(other)
+    return others
