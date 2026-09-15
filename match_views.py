@@ -21,6 +21,7 @@ def _format_profile(member: dict) -> str:
     """
     スプレッドシートのプロフィール情報（名前・年齢・性別・都道府県・市町村・
     業種・事業/活動内容）を、DMやチャンネル投稿用のテキストに整形する。
+    マッチング成立時に自動投稿するプロフィール用（A〜H列相当のみ）。
     """
     lines = [f"📇 {member['name']} さんのプロフィールです"]
 
@@ -40,6 +41,38 @@ def _format_profile(member: dict) -> str:
             lines.append(f"業種：{biz_type}")
         if biz_content:
             lines.append(f"事業/活動内容：{biz_content}")
+
+    return "\n".join(lines)
+
+
+def _format_full_profile(member: dict) -> str:
+    """
+    マッチング会員一覧（Webページ）に表示されているのと同じ情報一式
+    （年齢・性別・都道府県・市町村・業種・事業内容・URL）を整形する。
+    承認チャンネルの「プロフィール」ボタンの表示用。
+    """
+    lines = [f"📇 {member['name']} さんのプロフィールです"]
+
+    if member.get("age"):
+        lines.append(f"年齢：{member['age']}")
+    if member.get("gender"):
+        lines.append(f"性別：{member['gender']}")
+    if member.get("prefecture"):
+        lines.append(f"都道府県：{member['prefecture']}")
+    if member.get("city"):
+        lines.append(f"市町村：{member['city']}")
+
+    for biz in member.get("businesses", []):
+        biz_type = biz.get("type", "")
+        biz_content = biz.get("content", "")
+        if biz_type:
+            lines.append(f"業種：{biz_type}")
+        if biz_content:
+            lines.append(f"事業/活動内容：{biz_content}")
+
+    if member.get("urls"):
+        lines.append("URL：")
+        lines.extend(member["urls"])
 
     return "\n".join(lines)
 
@@ -112,55 +145,6 @@ class MatchApproveView(discord.ui.View):
             )
             return False
         return True
-
-    @discord.ui.button(label="プロフィールを見る", style=discord.ButtonStyle.secondary, custom_id="match_view_profile")
-    async def view_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """
-        申請してきた相手のプロフィールを、押した本人にだけ見える形（ephemeral）で表示する。
-        チャンネル上のメッセージ自体には表示しないことで、折りたたみのような見た目にしている。
-        """
-        request = match_store.get_request(self.request_id)
-
-        if request is None:
-            await interaction.response.send_message(
-                "この申請はすでに期限切れ、またはキャンセルされています。", ephemeral=True
-            )
-            return
-
-        if not await self._check_is_target(interaction, request):
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        if not GUILD_ID:
-            await interaction.followup.send(
-                "サーバー設定（GUILD_ID）が未設定のため、プロフィールを取得できませんでした。",
-                ephemeral=True,
-            )
-            return
-
-        guild = self.bot.get_guild(int(GUILD_ID))
-        if guild is None:
-            await interaction.followup.send("サーバー情報が取得できませんでした。", ephemeral=True)
-            return
-
-        try:
-            requester = await guild.fetch_member(int(request["requester_id"]))
-        except discord.NotFound:
-            await interaction.followup.send("申請者がサーバーに見つかりませんでした。", ephemeral=True)
-            return
-
-        try:
-            profile = sheets_client.find_member(str(requester.id))
-        except Exception as error:  # noqa: BLE001 - そのままエラー内容を見せる
-            await interaction.followup.send(f"プロフィールの取得に失敗しました：{error}", ephemeral=True)
-            return
-
-        if profile is None:
-            await interaction.followup.send("プロフィール情報が見つかりませんでした。", ephemeral=True)
-            return
-
-        await interaction.followup.send(_format_profile(profile), ephemeral=True)
 
     @discord.ui.button(label="承認する", style=discord.ButtonStyle.success, custom_id="match_approve")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -272,6 +256,56 @@ class MatchApproveView(discord.ui.View):
         except (discord.NotFound, discord.Forbidden):
             pass
 
+    @discord.ui.button(label="プロフィール", style=discord.ButtonStyle.secondary, custom_id="match_view_profile")
+    async def view_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """
+        申請してきた相手のプロフィールを、押した本人にだけ見える形（ephemeral）で表示する。
+        チャンネル上のメッセージ自体には表示しないことで、折りたたみのような見た目にしている。
+        内容はマッチング会員一覧（Webページ）に表示されているものと同じ情報一式。
+        """
+        request = match_store.get_request(self.request_id)
+
+        if request is None:
+            await interaction.response.send_message(
+                "この申請はすでに期限切れ、またはキャンセルされています。", ephemeral=True
+            )
+            return
+
+        if not await self._check_is_target(interaction, request):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        if not GUILD_ID:
+            await interaction.followup.send(
+                "サーバー設定（GUILD_ID）が未設定のため、プロフィールを取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        guild = self.bot.get_guild(int(GUILD_ID))
+        if guild is None:
+            await interaction.followup.send("サーバー情報が取得できませんでした。", ephemeral=True)
+            return
+
+        try:
+            requester = await guild.fetch_member(int(request["requester_id"]))
+        except discord.NotFound:
+            await interaction.followup.send("申請者がサーバーに見つかりませんでした。", ephemeral=True)
+            return
+
+        try:
+            profile = sheets_client.find_member(str(requester.id))
+        except Exception as error:  # noqa: BLE001 - そのままエラー内容を見せる
+            await interaction.followup.send(f"プロフィールの取得に失敗しました：{error}", ephemeral=True)
+            return
+
+        if profile is None:
+            await interaction.followup.send("プロフィール情報が見つかりませんでした。", ephemeral=True)
+            return
+
+        await interaction.followup.send(_format_full_profile(profile), ephemeral=True)
+
 
 async def send_match_request_to_channel(bot: discord.Client, requester_id: str, target_id: str, request_id: str):
     """
@@ -295,6 +329,6 @@ async def send_match_request_to_channel(bot: discord.Client, requester_id: str, 
     view = MatchApproveView(bot, request_id)
     await channel.send(
         f"{target.mention}\n{requester.display_name} さんからマッチの依頼が来ました！承認しますか？\n"
-        "（「プロフィールを見る」ボタンから相手の情報を確認できます）",
+        "（「プロフィール」ボタンから相手の情報を確認できます）",
         view=view,
     )
