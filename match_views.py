@@ -113,6 +113,55 @@ class MatchApproveView(discord.ui.View):
             return False
         return True
 
+    @discord.ui.button(label="プロフィールを見る", style=discord.ButtonStyle.secondary, custom_id="match_view_profile")
+    async def view_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """
+        申請してきた相手のプロフィールを、押した本人にだけ見える形（ephemeral）で表示する。
+        チャンネル上のメッセージ自体には表示しないことで、折りたたみのような見た目にしている。
+        """
+        request = match_store.get_request(self.request_id)
+
+        if request is None:
+            await interaction.response.send_message(
+                "この申請はすでに期限切れ、またはキャンセルされています。", ephemeral=True
+            )
+            return
+
+        if not await self._check_is_target(interaction, request):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        if not GUILD_ID:
+            await interaction.followup.send(
+                "サーバー設定（GUILD_ID）が未設定のため、プロフィールを取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        guild = self.bot.get_guild(int(GUILD_ID))
+        if guild is None:
+            await interaction.followup.send("サーバー情報が取得できませんでした。", ephemeral=True)
+            return
+
+        try:
+            requester = await guild.fetch_member(int(request["requester_id"]))
+        except discord.NotFound:
+            await interaction.followup.send("申請者がサーバーに見つかりませんでした。", ephemeral=True)
+            return
+
+        try:
+            profile = sheets_client.find_member(str(requester.id))
+        except Exception as error:  # noqa: BLE001 - そのままエラー内容を見せる
+            await interaction.followup.send(f"プロフィールの取得に失敗しました：{error}", ephemeral=True)
+            return
+
+        if profile is None:
+            await interaction.followup.send("プロフィール情報が見つかりませんでした。", ephemeral=True)
+            return
+
+        await interaction.followup.send(_format_profile(profile), ephemeral=True)
+
     @discord.ui.button(label="承認する", style=discord.ButtonStyle.success, custom_id="match_approve")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
         request = match_store.get_request(self.request_id)
@@ -245,6 +294,7 @@ async def send_match_request_to_channel(bot: discord.Client, requester_id: str, 
 
     view = MatchApproveView(bot, request_id)
     await channel.send(
-        f"{target.mention}\n{requester.display_name} さんからマッチの依頼が来ました！承認しますか？",
+        f"{target.mention}\n{requester.display_name} さんからマッチの依頼が来ました！承認しますか？\n"
+        "（「プロフィールを見る」ボタンから相手の情報を確認できます）",
         view=view,
     )
