@@ -166,9 +166,13 @@ def find_member_name(discord_id: str) -> str | None:
     return None
 
 
-def find_member(discord_id: str) -> dict | None:
-    """DiscordIDからプロフィール全体（名前・年齢・性別・都道府県・市町村・業種等）を引く。"""
-    for member in get_members():
+def find_member(discord_id: str, force_refresh: bool = False) -> dict | None:
+    """
+    DiscordIDからプロフィール全体（名前・年齢・性別・都道府県・市町村・業種等）を引く。
+    force_refresh=True で、キャッシュを無視して最新の内容を取得する
+    （名前登録直後など、すぐに反映を確認したい場合に使う）。
+    """
+    for member in get_members(force_refresh=force_refresh):
         if member["discord_id"] == str(discord_id):
             return member
     return None

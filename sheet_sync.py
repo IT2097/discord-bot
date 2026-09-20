@@ -172,3 +172,41 @@ def sync_discord_ids(guild_members: list[tuple[str, str]]) -> dict:
         "unmatched_sheet_names": unmatched_sheet_names,
         "unmatched_discord_names": unmatched_discord_names,
     }
+
+
+def append_new_member_row(profile: dict) -> None:
+    """
+    「名前（本名）」に一致する行がまだスプレッドシートに無い新規会員のために、
+    新しい行を追加する（Discord内でのプロフィール入力フォームから呼ばれる）。
+
+    profile には以下のキーを含める（無いものは空欄のまま書き込まれる）:
+      name, discord_id, age, gender, prefecture, city, business_type, business_content
+    """
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    sheet_name = os.getenv("SHEET_NAME", "会員")
+
+    if not spreadsheet_id:
+        raise RuntimeError("環境変数 SPREADSHEET_ID が設定されていません。")
+
+    client = _get_write_client()
+    sheet = client.open_by_key(spreadsheet_id).worksheet(sheet_name)
+
+    headers = sheet.row_values(1)
+    new_row = [""] * len(headers)
+
+    field_map = {
+        sheets_client.HEADER_NAME: profile.get("name", ""),
+        sheets_client.HEADER_DISCORD_ID: profile.get("discord_id", ""),
+        sheets_client.HEADER_AGE: profile.get("age", ""),
+        sheets_client.HEADER_GENDER: profile.get("gender", ""),
+        sheets_client.HEADER_PREFECTURE: profile.get("prefecture", ""),
+        sheets_client.HEADER_CITY: profile.get("city", ""),
+        sheets_client.HEADER_BUSINESS_TYPE: profile.get("business_type", ""),
+        sheets_client.HEADER_BUSINESS_CONTENT: profile.get("business_content", ""),
+    }
+
+    for header, value in field_map.items():
+        if header in headers and value:
+            new_row[headers.index(header)] = value
+
+    sheet.append_row(new_row)

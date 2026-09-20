@@ -9,8 +9,10 @@ import discord
 from discord.ext import commands
 
 import match_views
+import match_store
 import match_records
 import sheet_sync
+import sheets_client
 import web_app
 
 intents = discord.Intents.default()
@@ -167,6 +169,34 @@ async def sync_ids(ctx: commands.Context):
     await run_id_sync(ctx.guild, ctx.send)
 
 
+@bot.command(name="マッチング解除")
+@commands.has_permissions(administrator=True)
+async def unmatch(ctx: commands.Context, member_a: discord.Member, member_b: discord.Member):
+    """
+    2人のマッチング成立記録を取り消す（テストのやり直し用）管理者向けコマンド。
+    使い方: !マッチング解除 @ユーザー1 @ユーザー2
+    ※作成済みのプライベートなマッチングルーム自体は削除されないので、
+      不要であれば手動でチャンネルを削除してください。
+    """
+    match_store.unmark_matched(str(member_a.id), str(member_b.id))
+
+    try:
+        removed = await asyncio.to_thread(
+            match_records.remove_match, str(member_a.id), str(member_b.id)
+        )
+    except Exception as error:  # noqa: BLE001 - 管理者にそのままエラー内容を見せる
+        await ctx.send(f"エラーが発生しました：{error}")
+        return
+
+    if removed:
+        await ctx.send(f"✅ {member_a.mention} と {member_b.mention} のマッチング記録を削除しました。")
+    else:
+        await ctx.send(
+            f"ℹ️ 履歴シートには記録が見つかりませんでしたが、"
+            f"メモリ上の「マッチング中」の記録は削除しました（{member_a.mention} と {member_b.mention}）。"
+        )
+
+
 @bot.command(name="マッチング復元")
 @commands.has_permissions(administrator=True)
 async def restore_matches(ctx: commands.Context):
@@ -271,15 +301,165 @@ class NameModal(discord.ui.Modal, title="本名を登録"):
             return
 
         await interaction.followup.send(
-            f"「{full_name}」として登録しました！会員情報と自動で突き合わせています…",
+            f"「{full_name}」として登録しました！会員情報を確認しています…",
             ephemeral=True,
         )
 
-        # 名前登録が完了したので、サーバーの他のチャンネルを見られるようにする
-        await _remove_unverified_role(member)
+        # すでにスプレッドシートに同名の行があるか、その場で同期を試みる
+        channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
 
-        # ニックネームの変更自体は on_member_update が検知して自動でid同期を実行するため、
-        # ここで重複して呼び出す必要はない
+        async def send(*args, **kwargs):
+            if channel is not None:
+                await channel.send(*args, **kwargs)
+
+        await run_id_sync(guild, send)
+
+        profile = sheets_client.find_member(str(member.id), force_refresh=True)
+
+        if profile is not None:
+            # 既存の行と連携できたので、これで登録完了
+            await _remove_unverified_role(member)
+            await interaction.followup.send(
+                "既存の会員情報と連携できました！登録は完了です。", ephemeral=True
+            )
+            return
+
+        # 既存の行が見つからなかった新規会員には、続けてプロフィールを入力してもらう
+        await interaction.followup.send(
+            "会員情報が見つからなかったため、続けてプロフィールを入力してください。\n"
+            "まずは年齢と性別を選んで「次へ」を押してください。",
+            ephemeral=True,
+            view=ProfileBasicsView(member_id=member.id, name=full_name),
+        )
+
+
+AGE_OPTIONS = ["10代", "20代", "30代", "40代", "50代", "60代", "70代以上"]
+GENDER_OPTIONS = ["男性", "女性", "その他"]
+
+
+class ProfileBasicsView(discord.ui.View):
+    """
+    新規会員のプロフィール入力（1/2）。年齢・性別をプルダウンで選んでもらい、
+    「次へ」で都道府県・市町村・業種・事業内容の入力フォーム（2/2）に進む。
+    """
+
+    def __init__(self, member_id: int, name: str):
+        super().__init__(timeout=600)
+        self.member_id = member_id
+        self.name = name
+        self.selected_age: str | None = None
+        self.selected_gender: str | None = None
+
+    @discord.ui.select(
+        placeholder="年齢を選択",
+        options=[discord.SelectOption(label=age) for age in AGE_OPTIONS],
+    )
+    async def select_age(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.selected_age = select.values[0]
+        await interaction.response.defer()
+
+    @discord.ui.select(
+        placeholder="性別を選択",
+        options=[discord.SelectOption(label=gender) for gender in GENDER_OPTIONS],
+    )
+    async def select_gender(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.selected_gender = select.values[0]
+        await interaction.response.defer()
+
+    @discord.ui.button(label="次へ", style=discord.ButtonStyle.primary)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message(
+                "この登録フォームはあなた宛てではありません。", ephemeral=True
+            )
+            return
+
+        if not self.selected_age or not self.selected_gender:
+            await interaction.response.send_message(
+                "年齢と性別の両方を選択してから「次へ」を押してください。", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_modal(
+            ProfileDetailsModal(
+                member_id=self.member_id,
+                name=self.name,
+                age=self.selected_age,
+                gender=self.selected_gender,
+            )
+        )
+
+
+class ProfileDetailsModal(discord.ui.Modal, title="プロフィール入力（続き）"):
+    """
+    新規会員のプロフィール入力（2/2）。都道府県・市町村・業種・事業内容を入力してもらい、
+    完了したらスプレッドシートに新しい行として書き込む。
+    """
+
+    prefecture = discord.ui.TextInput(label="都道府県", placeholder="例：北海道", max_length=10)
+    city = discord.ui.TextInput(label="市町村", placeholder="例：札幌市", max_length=20)
+    business_type = discord.ui.TextInput(label="業種", placeholder="例：飲食サービス", max_length=30)
+    business_content = discord.ui.TextInput(
+        label="事業/活動内容",
+        style=discord.TextStyle.paragraph,
+        placeholder="例：カフェの経営",
+        max_length=200,
+    )
+
+    def __init__(self, member_id: int, name: str, age: str, gender: str):
+        super().__init__()
+        self.member_id = member_id
+        self.name = name
+        self.age = age
+        self.gender = gender
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        # 二重登録防止：この間に別の経路ですでに登録が完了していないか念のため確認する
+        existing = sheets_client.find_member(str(self.member_id), force_refresh=True)
+        if existing is not None:
+            await interaction.followup.send(
+                "すでに会員情報が登録されているようです。登録は完了しています。",
+                ephemeral=True,
+            )
+            return
+
+        profile = {
+            "name": self.name,
+            "discord_id": str(self.member_id),
+            "age": self.age,
+            "gender": self.gender,
+            "prefecture": self.prefecture.value.strip(),
+            "city": self.city.value.strip(),
+            "business_type": self.business_type.value.strip(),
+            "business_content": self.business_content.value.strip(),
+        }
+
+        try:
+            await asyncio.to_thread(sheet_sync.append_new_member_row, profile)
+        except Exception as error:  # noqa: BLE001 - 本人にそのままエラー内容を見せる
+            await interaction.followup.send(
+                f"スプレッドシートへの登録に失敗しました：{error}", ephemeral=True
+            )
+            return
+
+        # 直接書き込んだ内容を、キャッシュを待たずにすぐ一覧へ反映させる
+        sheets_client.get_members(force_refresh=True)
+
+        guild_id = os.getenv("GUILD_ID")
+        if guild_id:
+            guild = bot.get_guild(int(guild_id))
+            if guild is not None:
+                try:
+                    member = await guild.fetch_member(self.member_id)
+                    await _remove_unverified_role(member)
+                except discord.NotFound:
+                    pass
+
+        await interaction.followup.send(
+            "プロフィールの登録が完了しました！ありがとうございます。", ephemeral=True
+        )
 
 
 class NameRegisterView(discord.ui.View):
