@@ -194,9 +194,6 @@ h1 {
   font-size: 12px;
   color: var(--text-muted);
   margin-top: 2px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .expand-btn {
