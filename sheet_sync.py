@@ -174,14 +174,21 @@ def sync_discord_ids(guild_members: list[tuple[str, str]]) -> dict:
     }
 
 
-def append_new_member_row(profile: dict) -> None:
+def append_new_member_rows(base_profile: dict, businesses: list[dict]) -> None:
     """
     「名前（本名）」に一致する行がまだスプレッドシートに無い新規会員のために、
-    新しい行を追加する（Discord内でのプロフィール入力フォームから呼ばれる）。
+    業種・事業内容の件数だけ複数行を追加する（Discord内でのプロフィール入力
+    フォームから呼ばれる）。名前・年齢・性別・都道府県・市町村は全行共通、
+    業種・事業内容だけ行ごとに変える。DiscordIDは既存の複数行会員データの
+    形式に合わせて最初の1行にのみ入れる。
 
-    profile には以下のキーを含める（無いものは空欄のまま書き込まれる）:
-      name, discord_id, age, gender, prefecture, city, business_type, business_content
+    base_profile には以下のキーを含める（無いものは空欄のまま書き込まれる）:
+      name, discord_id, age, gender, prefecture, city
+    businesses は [{"type": ..., "content": ...}, ...] の形式で1件以上必要。
     """
+    if not businesses:
+        raise ValueError("businesses は1件以上必要です。")
+
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
     sheet_name = os.getenv("SHEET_NAME", "会員")
 
@@ -192,21 +199,26 @@ def append_new_member_row(profile: dict) -> None:
     sheet = client.open_by_key(spreadsheet_id).worksheet(sheet_name)
 
     headers = sheet.row_values(1)
-    new_row = [""] * len(headers)
+    rows_to_add = []
 
-    field_map = {
-        sheets_client.HEADER_NAME: profile.get("name", ""),
-        sheets_client.HEADER_DISCORD_ID: profile.get("discord_id", ""),
-        sheets_client.HEADER_AGE: profile.get("age", ""),
-        sheets_client.HEADER_GENDER: profile.get("gender", ""),
-        sheets_client.HEADER_PREFECTURE: profile.get("prefecture", ""),
-        sheets_client.HEADER_CITY: profile.get("city", ""),
-        sheets_client.HEADER_BUSINESS_TYPE: profile.get("business_type", ""),
-        sheets_client.HEADER_BUSINESS_CONTENT: profile.get("business_content", ""),
-    }
+    for index, biz in enumerate(businesses):
+        new_row = [""] * len(headers)
+        field_map = {
+            sheets_client.HEADER_NAME: base_profile.get("name", ""),
+            # DiscordIDは最初の行にだけ入れる（既存の複数行会員データの形式に合わせる）
+            sheets_client.HEADER_DISCORD_ID: base_profile.get("discord_id", "") if index == 0 else "",
+            sheets_client.HEADER_AGE: base_profile.get("age", ""),
+            sheets_client.HEADER_GENDER: base_profile.get("gender", ""),
+            sheets_client.HEADER_PREFECTURE: base_profile.get("prefecture", ""),
+            sheets_client.HEADER_CITY: base_profile.get("city", ""),
+            sheets_client.HEADER_BUSINESS_TYPE: biz.get("type", ""),
+            sheets_client.HEADER_BUSINESS_CONTENT: biz.get("content", ""),
+        }
 
-    for header, value in field_map.items():
-        if header in headers and value:
-            new_row[headers.index(header)] = value
+        for header, value in field_map.items():
+            if header in headers and value:
+                new_row[headers.index(header)] = value
 
-    sheet.append_row(new_row)
+        rows_to_add.append(new_row)
+
+    sheet.append_rows(rows_to_add)

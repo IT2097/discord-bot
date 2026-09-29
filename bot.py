@@ -31,12 +31,12 @@ WEB_APP_URL = os.getenv("WEB_APP_URL")
 # 新規メンバー参加時に「id同期」の結果を投稿するチャンネル名
 ID_SYNC_LOG_CHANNEL_NAME = os.getenv("ID_SYNC_LOG_CHANNEL_NAME", "id同期ログ")
 
-# DMが送れないメンバーのために、本名登録ボタンを常設しておくチャンネル名
+# DMではなく、名前登録チャンネル内でメンション付きで通知するために使うチャンネル名
 NAME_REGISTER_CHANNEL_NAME = os.getenv("NAME_REGISTER_CHANNEL_NAME", "名前登録")
 
 # 参加直後に自動付与し、本名登録が終わったら自動で外すロール名
-# （このロールには、事前にDiscord側で「名前登録チャンネル以外は見られない」
-# 権限設定をしておく必要があります）
+# （名前登録チャンネルも含め、すべてのチャンネルをこのロールから見えなくする想定。
+#   名前登録チャンネルだけは、本人にのみ個別の閲覧権限を一時的に付与する）
 UNVERIFIED_ROLE_NAME = os.getenv("UNVERIFIED_ROLE_NAME", "未登録")
 
 
@@ -50,6 +50,22 @@ async def _remove_unverified_role(member: discord.Member):
             await member.remove_roles(role, reason="本名登録が完了したため")
         except discord.Forbidden:
             print(f"「{UNVERIFIED_ROLE_NAME}」ロールを外す権限がBotにありません。")
+
+
+async def _finish_registration(member: discord.Member):
+    """
+    本名登録が完了したメンバーの制限を解除する。
+    「未登録」ロールを外し、名前登録チャンネルに一時的に付与していた
+    本人専用の閲覧権限も片付ける。
+    """
+    await _remove_unverified_role(member)
+
+    register_channel = discord.utils.get(member.guild.text_channels, name=NAME_REGISTER_CHANNEL_NAME)
+    if register_channel is not None:
+        try:
+            await register_channel.set_permissions(member, overwrite=None)
+        except discord.Forbidden:
+            pass
 
 
 def run_coro(coro, timeout: int = 15):
@@ -167,6 +183,38 @@ async def sync_ids(ctx: commands.Context):
     """管理者がチャンネルで「!id同期」と打った時に手動で実行するコマンド。"""
     await ctx.send("Discordメンバーとスプレッドシートを突き合わせています…（少し時間がかかります）")
     await run_id_sync(ctx.guild, ctx.send)
+
+
+@bot.command(name="未登録ロール設定")
+@commands.has_permissions(administrator=True)
+async def setup_unverified_role(ctx: commands.Context):
+    """
+    「未登録」ロールから、サーバー内のすべてのチャンネルを見えなくする権限設定を
+    まとめて適用する管理者向けコマンド。
+    名前登録チャンネルは、本人にだけ参加時に個別で閲覧権限を付与する方式にしているため、
+    ロールとしての例外は設けない（＝未登録の人には何も見えない状態になる）。
+    チャンネル構成を変えた時は、このコマンドを再実行してください。
+    """
+    role = discord.utils.get(ctx.guild.roles, name=UNVERIFIED_ROLE_NAME)
+    if role is None:
+        await ctx.send(f"「{UNVERIFIED_ROLE_NAME}」という名前のロールが見つかりませんでした。先にロールを作成してください。")
+        return
+
+    await ctx.send("チャンネル権限を設定しています…（少し時間がかかります）")
+
+    count = 0
+    failed = 0
+    for channel in ctx.guild.channels:
+        try:
+            await channel.set_permissions(role, view_channel=False)
+            count += 1
+        except discord.Forbidden:
+            failed += 1
+
+    message = f"✅ {count}件のチャンネルを「{UNVERIFIED_ROLE_NAME}」ロールから見えないようにしました。"
+    if failed:
+        message += f"\n⚠️ {failed}件は権限不足のため設定できませんでした。"
+    await ctx.send(message)
 
 
 @bot.command(name="マッチング解除")
@@ -318,18 +366,38 @@ class NameModal(discord.ui.Modal, title="本名を登録"):
 
         if profile is not None:
             # 既存の行と連携できたので、これで登録完了
-            await _remove_unverified_role(member)
+            await _finish_registration(member)
             await interaction.followup.send(
                 "既存の会員情報と連携できました！登録は完了です。", ephemeral=True
             )
             return
 
+        # 業種のプルダウン選択肢を取得できないと次のフォームが作れないので、先に確認する
+        try:
+            business_type_options = sheets_client.get_business_type_options()
+        except Exception as error:  # noqa: BLE001 - 本人にそのままエラー内容を見せる
+            await interaction.followup.send(
+                f"業種の選択肢の取得に失敗しました：{error}\n管理者に連絡してください。",
+                ephemeral=True,
+            )
+            return
+
+        if not business_type_options:
+            await interaction.followup.send(
+                "業種の選択肢が設定されていないようです。管理者に連絡してください。",
+                ephemeral=True,
+            )
+            return
+
         # 既存の行が見つからなかった新規会員には、続けてプロフィールを入力してもらう
+        state = RegistrationState(
+            member_id=member.id, name=full_name, business_type_options=business_type_options
+        )
         await interaction.followup.send(
             "会員情報が見つからなかったため、続けてプロフィールを入力してください。\n"
-            "まずは年齢と性別を選んで「次へ」を押してください。",
+            "まずは年齢・性別を選んで「次へ」を押してください。",
             ephemeral=True,
-            view=ProfileBasicsView(member_id=member.id, name=full_name),
+            view=ProfileBasicsView(state),
         )
 
 
@@ -337,16 +405,35 @@ AGE_OPTIONS = ["10代", "20代", "30代", "40代", "50代", "60代", "70代以�
 GENDER_OPTIONS = ["男性", "女性", "その他"]
 
 
-class ProfileBasicsView(discord.ui.View):
+class BusinessTypeSelect(discord.ui.Select):
     """
-    新規会員のプロフィール入力（1/2）。年齢・性別をプルダウンで選んでもらい、
-    「次へ」で都道府県・市町村・業種・事業内容の入力フォーム（2/2）に進む。
+    業種の選択肢（スプレッドシートの「設定」シート「業種1」列から取得）。
+    Discordのプルダウンは1つにつき最大25個までのため、超える分は先頭25個に絞る。
+    選択した値は .values からいつでも読み取れるようにするだけで、
+    特別な処理は行わない（選択の確定だけAcknowledgeする）。
     """
 
-    def __init__(self, member_id: int, name: str):
-        super().__init__(timeout=600)
+    def __init__(self, options: list[str]):
+        super().__init__(
+            placeholder="業種を選択",
+            options=[discord.SelectOption(label=option) for option in options[:25]],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+
+class ProfileBasicsView(discord.ui.View):
+    """
+    新規会員のプロフィール入力（1/3）。年齢・性別をプルダウンで選んでもらい、
+    「次へ」で都道府県・市町村の入力フォーム（2/3）に進む。
+    """
+
+    def __init__(self, member_id: int, name: str, business_type_options: list[str]):
+        super().__init__(timeout=900)
         self.member_id = member_id
         self.name = name
+        self.business_type_options = business_type_options
         self.selected_age: str | None = None
         self.selected_gender: str | None = None
 
@@ -381,66 +468,133 @@ class ProfileBasicsView(discord.ui.View):
             return
 
         await interaction.response.send_modal(
-            ProfileDetailsModal(
+            ProfileLocationModal(
                 member_id=self.member_id,
                 name=self.name,
                 age=self.selected_age,
                 gender=self.selected_gender,
+                business_type_options=self.business_type_options,
             )
         )
 
 
-class ProfileDetailsModal(discord.ui.Modal, title="プロフィール入力（続き）"):
+class ProfileLocationModal(discord.ui.Modal, title="プロフィール入力（続き）"):
     """
-    新規会員のプロフィール入力（2/2）。都道府県・市町村・業種・事業内容を入力してもらい、
-    完了したらスプレッドシートに新しい行として書き込む。
+    新規会員のプロフィール入力（2/3）。都道府県・市町村を入力してもらい、
+    続けて業種・事業内容を入力するフォーム（3/3）に進む。
     """
 
     prefecture = discord.ui.TextInput(label="都道府県", placeholder="例：北海道", max_length=10)
     city = discord.ui.TextInput(label="市町村", placeholder="例：札幌市", max_length=20)
-    business_type = discord.ui.TextInput(label="業種", placeholder="例：飲食サービス", max_length=30)
-    business_content = discord.ui.TextInput(
-        label="事業/活動内容",
-        style=discord.TextStyle.paragraph,
-        placeholder="例：カフェの経営",
-        max_length=200,
-    )
 
-    def __init__(self, member_id: int, name: str, age: str, gender: str):
+    def __init__(self, member_id: int, name: str, age: str, gender: str, business_type_options: list[str]):
         super().__init__()
         self.member_id = member_id
         self.name = name
         self.age = age
         self.gender = gender
+        self.business_type_options = business_type_options
 
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
-        # 二重登録防止：この間に別の経路ですでに登録が完了していないか念のため確認する
-        existing = sheets_client.find_member(str(self.member_id), force_refresh=True)
-        if existing is not None:
-            await interaction.followup.send(
-                "すでに会員情報が登録されているようです。登録は完了しています。",
-                ephemeral=True,
-            )
-            return
-
-        profile = {
+        base_profile = {
             "name": self.name,
             "discord_id": str(self.member_id),
             "age": self.age,
             "gender": self.gender,
             "prefecture": self.prefecture.value.strip(),
             "city": self.city.value.strip(),
-            "business_type": self.business_type.value.strip(),
-            "business_content": self.business_content.value.strip(),
         }
 
+        view = BusinessEntryView(
+            member_id=self.member_id,
+            base_profile=base_profile,
+            business_type_options=self.business_type_options,
+        )
+        await interaction.response.edit_message(content=view.summary_text(), view=view)
+
+
+class BusinessEntryView(discord.ui.View):
+    """
+    新規会員のプロフィール入力（3/3）。業種を選んで「業種を追加」を押すと
+    事業/活動内容の入力フォームが開き、業種とセットで1件ずつ登録できる。
+    何度でも追加でき、「登録を完了する」でスプレッドシートに書き込む
+    （追加した業種の数だけ複数行に分かれて書き込まれる）。
+    """
+
+    def __init__(self, member_id: int, base_profile: dict, business_type_options: list[str]):
+        super().__init__(timeout=900)
+        self.member_id = member_id
+        self.base_profile = base_profile
+        self.businesses: list[dict] = []
+
+        self.type_select = BusinessTypeSelect(business_type_options)
+        self.add_item(self.type_select)
+
+    def summary_text(self) -> str:
+        if not self.businesses:
+            listing = "（まだありません）"
+        else:
+            listing = "\n".join(
+                f"{i + 1}. {biz['type']}：{biz['content']}" for i, biz in enumerate(self.businesses)
+            )
+        return (
+            "業種を選択して「業種を追加」を押すと、事業/活動内容を入力できます。\n"
+            "複数の業種がある場合は、繰り返し追加してください。\n"
+            "すべて入力したら「登録を完了する」を押してください。\n\n"
+            f"【現在登録した業種】\n{listing}"
+        )
+
+    @discord.ui.button(label="業種を追加", style=discord.ButtonStyle.secondary)
+    async def add_business(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message(
+                "この登録フォームはあなた宛てではありません。", ephemeral=True
+            )
+            return
+
+        selected = self.type_select.values[0] if self.type_select.values else None
+        if not selected:
+            await interaction.response.send_message(
+                "先に業種を選択してから「業種を追加」を押してください。", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_modal(
+            BusinessContentModal(parent_view=self, business_type=selected)
+        )
+
+    @discord.ui.button(label="登録を完了する", style=discord.ButtonStyle.primary)
+    async def finish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message(
+                "この登録フォームはあなた宛てではありません。", ephemeral=True
+            )
+            return
+
+        if not self.businesses:
+            await interaction.response.send_message(
+                "業種を1件も追加していません。「業種を追加」から少なくとも1件入力してください。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+
+        # 二重登録防止：この間に別の経路ですでに登録が完了していないか念のため確認する
+        existing = sheets_client.find_member(str(self.member_id), force_refresh=True)
+        if existing is not None:
+            await interaction.edit_original_response(
+                content="すでに会員情報が登録されているようです。登録は完了しています。", view=None
+            )
+            return
+
         try:
-            await asyncio.to_thread(sheet_sync.append_new_member_row, profile)
+            await asyncio.to_thread(
+                sheet_sync.append_new_member_rows, self.base_profile, self.businesses
+            )
         except Exception as error:  # noqa: BLE001 - 本人にそのままエラー内容を見せる
-            await interaction.followup.send(
-                f"スプレッドシートへの登録に失敗しました：{error}", ephemeral=True
+            await interaction.edit_original_response(
+                content=f"スプレッドシートへの登録に失敗しました：{error}", view=None
             )
             return
 
@@ -453,12 +607,39 @@ class ProfileDetailsModal(discord.ui.Modal, title="プロフィール入力（�
             if guild is not None:
                 try:
                     member = await guild.fetch_member(self.member_id)
-                    await _remove_unverified_role(member)
+                    await _finish_registration(member)
                 except discord.NotFound:
                     pass
 
-        await interaction.followup.send(
-            "プロフィールの登録が完了しました！ありがとうございます。", ephemeral=True
+        await interaction.edit_original_response(
+            content="プロフィールの登録が完了しました！ありがとうございます。", view=None
+        )
+
+
+class BusinessContentModal(discord.ui.Modal, title="事業/活動内容を入力"):
+    """
+    「業種を追加」ボタンから開くフォーム。事業/活動内容だけを入力してもらい、
+    選択済みの業種とセットにして元の一覧に追加する。
+    """
+
+    content = discord.ui.TextInput(
+        label="事業/活動内容",
+        style=discord.TextStyle.paragraph,
+        placeholder="例：カフェの経営",
+        max_length=200,
+    )
+
+    def __init__(self, parent_view: BusinessEntryView, business_type: str):
+        super().__init__()
+        self.parent_view = parent_view
+        self.business_type = business_type
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.parent_view.businesses.append(
+            {"type": self.business_type, "content": self.content.value.strip()}
+        )
+        await interaction.response.edit_message(
+            content=self.parent_view.summary_text(), view=self.parent_view
         )
 
 
@@ -480,7 +661,8 @@ async def on_member_join(member: discord.Member):
     """
     新しいメンバーがサーバーに参加したら、
     1. 「未登録」ロールを付与する（名前登録が終わるまで他のチャンネルを見せないため）
-    2. 本名登録フォーム（DM）を送る。DMが送れない場合は「名前登録」チャンネルで案内する
+    2. 「名前登録」チャンネルへの閲覧権限を本人にだけ一時的に付与し、
+       そのチャンネル内でメンション付きの案内メッセージを送る（DMは使わない）
     3. 自動で「id同期」も実行する（すでにシートに名前がある人を拾うため）
     """
     guild = member.guild
@@ -494,19 +676,22 @@ async def on_member_join(member: discord.Member):
     else:
         print(f"「{UNVERIFIED_ROLE_NAME}」という名前のロールが見つかりませんでした。")
 
-    try:
-        await member.send(
-            f"🎉 {guild.name} へようこそ！\n"
+    register_channel = discord.utils.get(guild.text_channels, name=NAME_REGISTER_CHANNEL_NAME)
+    if register_channel is not None:
+        try:
+            await register_channel.set_permissions(
+                member, view_channel=True, send_messages=True, read_message_history=True
+            )
+        except discord.Forbidden:
+            print(f"「{NAME_REGISTER_CHANNEL_NAME}」チャンネルの権限設定に失敗しました。")
+
+        await register_channel.send(
+            f"🎉 {member.mention} さん、ようこそ！\n"
             "会員情報と連携するために、まずは本名を登録してください。",
             view=NameRegisterView(),
         )
-    except discord.Forbidden:
-        # DMを閉じているユーザーには、サーバー内の「名前登録」チャンネルで案内する
-        register_channel = discord.utils.get(guild.text_channels, name=NAME_REGISTER_CHANNEL_NAME)
-        if register_channel is not None:
-            await register_channel.send(
-                f"{member.mention} さん、ようこそ！DMが送れなかったため、こちらから本名を登録してください👇"
-            )
+    else:
+        print(f"「{NAME_REGISTER_CHANNEL_NAME}」という名前のテキストチャンネルが見つかりませんでした。")
 
     channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
 
@@ -578,32 +763,6 @@ async def post_matching_room_link():
     await channel.send(f"🔗 会員情報の確認・マッチング申請はこちらから！\n{WEB_APP_URL}")
 
 
-async def post_name_register_button():
-    """
-    「名前登録」チャンネルに、本名登録ボタンを投稿する
-    （DMを受け取れないメンバーのための導線）。すでに投稿済みなら再投稿しない。
-    """
-    guild_id = os.getenv("GUILD_ID")
-
-    if not guild_id:
-        return
-
-    guild = bot.get_guild(int(guild_id))
-    if guild is None:
-        return
-
-    channel = discord.utils.get(guild.text_channels, name=NAME_REGISTER_CHANNEL_NAME)
-    if channel is None:
-        print(f"「{NAME_REGISTER_CHANNEL_NAME}」という名前のテキストチャンネルが見つかりませんでした。")
-        return
-
-    async for message in channel.history(limit=20):
-        if message.author.id == bot.user.id and message.components:
-            return  # すでに投稿済み
-
-    await channel.send("本名を登録するには、下のボタンを押してください👇", view=NameRegisterView())
-
-
 @bot.event
 async def on_ready():
     global bot_loop
@@ -615,7 +774,6 @@ async def on_ready():
     print(f"ログインしました: {bot.user}")
 
     await post_matching_room_link()
-    await post_name_register_button()
 
 
 def start_web_server():

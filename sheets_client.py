@@ -39,6 +39,10 @@ HEADER_URL_2 = "URL②"
 HEADER_URL_3 = "URL③"
 CACHE_SECONDS = 300  # スプレッドシートを毎回読みに行かず、5分間だけ結果をキャッシュする
 
+# 業種のプルダウン選択肢を読み込む「設定」シートの名前・見出し名
+BUSINESS_TYPE_SETTINGS_SHEET_NAME = os.getenv("BUSINESS_TYPE_SETTINGS_SHEET_NAME", "設定")
+BUSINESS_TYPE_SETTINGS_HEADER = os.getenv("BUSINESS_TYPE_SETTINGS_HEADER", "業種1")
+
 # get_all_records() に明示的に渡す想定ヘッダー。
 # これを渡すことで、他の列の見出しが空欄・重複していてもエラーにならない
 # （逆にここに書いた列の見出しは、スプレッドシート上で必ず一致させる必要がある）。
@@ -63,6 +67,7 @@ _SCOPES = [
 
 _lock = threading.Lock()
 _cache = {"data": None, "fetched_at": 0.0}
+_business_type_cache = {"data": None, "fetched_at": 0.0}
 
 
 def _get_client():
@@ -176,3 +181,46 @@ def find_member(discord_id: str, force_refresh: bool = False) -> dict | None:
         if member["discord_id"] == str(discord_id):
             return member
     return None
+
+
+def _fetch_business_type_options() -> list[str]:
+    spreadsheet_id = os.getenv("SPREADSHEET_ID")
+    if not spreadsheet_id:
+        raise RuntimeError("環境変数 SPREADSHEET_ID が設定されていません。")
+
+    client = _get_client()
+    spreadsheet = client.open_by_key(spreadsheet_id)
+
+    try:
+        sheet = spreadsheet.worksheet(BUSINESS_TYPE_SETTINGS_SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound as error:
+        raise RuntimeError(
+            f"「{BUSINESS_TYPE_SETTINGS_SHEET_NAME}」という名前のシートが見つかりませんでした。"
+        ) from error
+
+    header_row = sheet.row_values(1)
+    if BUSINESS_TYPE_SETTINGS_HEADER not in header_row:
+        raise RuntimeError(
+            f"「{BUSINESS_TYPE_SETTINGS_SHEET_NAME}」シートに"
+            f"「{BUSINESS_TYPE_SETTINGS_HEADER}」という見出しの列が見つかりませんでした。"
+        )
+
+    col_index = header_row.index(BUSINESS_TYPE_SETTINGS_HEADER) + 1
+    column_values = sheet.col_values(col_index)[1:]  # 1行目（見出し）を除く
+    return [value.strip() for value in column_values if value.strip()]
+
+
+def get_business_type_options(force_refresh: bool = False) -> list[str]:
+    """
+    「設定」シートの「業種1」列から、業種のプルダウン選択肢を取得する
+    （短時間キャッシュ付き）。
+    """
+    with _lock:
+        now = time.time()
+        is_stale = (now - _business_type_cache["fetched_at"]) > CACHE_SECONDS
+
+        if force_refresh or is_stale or _business_type_cache["data"] is None:
+            _business_type_cache["data"] = _fetch_business_type_options()
+            _business_type_cache["fetched_at"] = now
+
+        return list(_business_type_cache["data"])
