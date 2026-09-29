@@ -167,15 +167,15 @@ async def run_id_sync(guild: discord.Guild, send):
         lines.append("👤 Discordにいるがシートで一致しなかった表示名：")
         lines.append("、".join(result["unmatched_discord_names"]))
 
-    # 候補が複数・未一致のいずれかがあれば、管理者ロールにメンションして気づきやすくする
-    needs_attention = bool(
-        result["ambiguous_names"] or result["unmatched_sheet_names"] or result["unmatched_discord_names"]
-    )
+    # 「Discordにいるがシートで一致しなかった表示名」がある場合だけ、
+    # 管理者ロールにメンションして気づきやすくする
+    # （候補が複数・シート側だけの未一致は既存データに大量にあるため対象外にする）
+    needs_attention = bool(result["unmatched_discord_names"])
     mention_prefix = ""
     if needs_attention:
         admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE_NAME)
         if admin_role is not None:
-            mention_prefix = f"{admin_role.mention} 一致しない名前があります。ご確認ください。\n\n"
+            mention_prefix = f"{admin_role.mention} シートに無いDiscordメンバーがいます。ご確認ください。\n\n"
         else:
             print(f"「{ADMIN_ROLE_NAME}」という名前のロールが見つからないため、メンションできませんでした。")
 
