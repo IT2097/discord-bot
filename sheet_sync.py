@@ -131,6 +131,13 @@ def sync_discord_ids(guild_members: list[tuple[str, str]]) -> dict:
         existing_id = row[id_col - 1].strip() if len(row) >= id_col else ""
         sheet_name_value = row[name_col - 1].strip() if len(row) >= name_col else ""
 
+        if existing_id:
+            # すでに連携済みの行は書き込み対象外だが、「未一致」リストにも
+            # 出さないよう、連携済みとして記録しておく
+            used_discord_ids.add(existing_id)
+            if sheet_name_value:
+                matched_sheet_names.add(sheet_name_value)
+
         if existing_id or not sheet_name_value:
             continue  # 入力済み、または名前が空の行はスキップ
 
