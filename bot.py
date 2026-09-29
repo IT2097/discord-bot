@@ -39,6 +39,9 @@ NAME_REGISTER_CHANNEL_NAME = os.getenv("NAME_REGISTER_CHANNEL_NAME", "名前登�
 #   名前登録チャンネルだけは、本人にのみ個別の閲覧権限を一時的に付与する）
 UNVERIFIED_ROLE_NAME = os.getenv("UNVERIFIED_ROLE_NAME", "未登録")
 
+# id同期の結果に「候補が複数」「未一致」がある場合にメンションするロール名
+ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "管理者")
+
 
 async def _remove_unverified_role(member: discord.Member):
     """本名登録が完了したメンバーから「未登録」ロールを外す。"""
@@ -164,15 +167,28 @@ async def run_id_sync(guild: discord.Guild, send):
         lines.append("👤 Discordにいるがシートで一致しなかった表示名：")
         lines.append("、".join(result["unmatched_discord_names"]))
 
-    message = "\n".join(lines)
+    # 候補が複数・未一致のいずれかがあれば、管理者ロールにメンションして気づきやすくする
+    needs_attention = bool(
+        result["ambiguous_names"] or result["unmatched_sheet_names"] or result["unmatched_discord_names"]
+    )
+    mention_prefix = ""
+    if needs_attention:
+        admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE_NAME)
+        if admin_role is not None:
+            mention_prefix = f"{admin_role.mention} 一致しない名前があります。ご確認ください。\n\n"
+        else:
+            print(f"「{ADMIN_ROLE_NAME}」という名前のロールが見つからないため、メンションできませんでした。")
+
+    body = "\n".join(lines)
+    message = mention_prefix + body
 
     if len(message) <= 1900:
         await send(message)
     else:
         # Discordの1メッセージ2000文字制限を超える場合はテキストファイルで送る
-        buffer = io.StringIO(message)
+        buffer = io.StringIO(body)
         await send(
-            "結果が長くなったのでファイルに出力しました。",
+            f"{mention_prefix}結果が長くなったのでファイルに出力しました。",
             file=discord.File(fp=buffer, filename="id同期結果.txt"),
         )
 
