@@ -24,6 +24,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Botのイベントループへの参照。on_ready で確定させる。
 bot_loop: asyncio.AbstractEventLoop | None = None
 
+# デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
+BOT_VERSION = "2026-09-30b 会員ロール診断版"
+
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
 WEB_APP_URL = os.getenv("WEB_APP_URL")
@@ -42,6 +45,23 @@ UNVERIFIED_ROLE_NAME = os.getenv("UNVERIFIED_ROLE_NAME", "未登録")
 # id同期の結果に「候補が複数」「未一致」がある場合にメンションするロール名
 ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "管理者")
 
+# 本名登録が完了したら自動付与するロール名。
+# マッチングルーム・承認チャンネルなど「登録済みの会員だけに見せたい」チャンネルは、
+# このロールを持つ人だけが見られる「許可リスト方式」（@everyoneは非表示、このロールだけ許可）に統一する。
+# 「未登録ロールを禁止する」方式（deny方式）は設定漏れがあると素通しで見えてしまうため、
+# こちらのより確実な方式に切り替える。
+MEMBER_ROLE_NAME = os.getenv("MEMBER_ROLE_NAME", "会員")
+
+# 「会員」ロールを持つ人だけに表示するチャンネル名（カンマ区切りで環境変数からも追加できる）
+MEMBER_ONLY_CHANNEL_NAMES = [
+    name.strip()
+    for name in os.getenv(
+        "MEMBER_ONLY_CHANNEL_NAMES",
+        f"{MATCHING_ROOM_CHANNEL_NAME},{match_views.APPROVAL_CHANNEL_NAME}",
+    ).split(",")
+    if name.strip()
+]
+
 
 async def _remove_unverified_role(member: discord.Member):
     """本名登録が完了したメンバーから「未登録」ロールを外す。"""
@@ -55,13 +75,122 @@ async def _remove_unverified_role(member: discord.Member):
             print(f"「{UNVERIFIED_ROLE_NAME}」ロールを外す権限がBotにありません。")
 
 
+async def _grant_member_role(member: discord.Member):
+    """本名登録が完了したメンバーに「会員」ロールを付与する（許可リスト方式のチャンネル閲覧用）。"""
+    role = discord.utils.get(member.guild.roles, name=MEMBER_ROLE_NAME)
+    if role is None:
+        print(f"「{MEMBER_ROLE_NAME}」という名前のロールが見つかりませんでした。先にロールを作成してください。")
+        return
+    if role not in member.roles:
+        try:
+            await member.add_roles(role, reason="本名登録が完了したため")
+        except discord.Forbidden:
+            print(f"「{MEMBER_ROLE_NAME}」ロールを付与する権限がBotにありません。")
+
+
+async def _grant_member_role_to_linked(guild: discord.Guild, linked_ids: list[str] | None = None) -> dict:
+    """
+    スプレッドシートとDiscordの紐づけが完了している人（DiscordIDが入っている人）全員に
+    「会員」ロールを付与する。id同期のたびに呼び出すことで、
+    今回新たに一致した人だけでなく、以前から紐づけ済みだった人
+    （本番移行時にすでに参加している何十人もの既存会員など）にも
+    もれなくロールが行き渡るようにする。
+
+    戻り値：
+      role_missing  … 「会員」ロールがサーバーに存在しない（先に作成が必要）
+      granted       … 新たにロールを付与した人数
+      failed        … 権限不足等で付与に失敗した人数
+        （Botに「ロールの管理」権限が無い、またはBotの最上位ロールが
+          「会員」ロールより下にある場合に発生する。Discordの仕様上、
+          Botは自分より上位のロールを付与できないため）
+    """
+    result = {
+        "role_missing": False,
+        "targets": 0,         # 付与対象（サーバー内にいて紐づけ済み）の人数
+        "granted": 0,         # 今回新たに付与した人数
+        "already": 0,         # すでにロールを持っていた人数
+        "failed": 0,          # 付与に失敗した人数
+        "error": None,        # 失敗時のエラー内容（最初の1件）
+    }
+
+    role = discord.utils.get(guild.roles, name=MEMBER_ROLE_NAME)
+    if role is None:
+        print(f"「{MEMBER_ROLE_NAME}」という名前のロールが見つかりませんでした。先にロールを作成してください。")
+        result["role_missing"] = True
+        return result
+
+    if linked_ids is None:
+        # 対象IDが渡されなかった場合はシートから取得する
+        try:
+            members_data = await asyncio.to_thread(sheets_client.get_members, True)
+        except Exception as error:  # noqa: BLE001 - 呼び出し元でエラー内容を表示する
+            result["error"] = f"スプレッドシート取得エラー：{error}"
+            return result
+        linked_ids = [m["discord_id"] for m in members_data if m.get("discord_id")]
+
+    for discord_id in set(linked_ids):
+        try:
+            discord_id_int = int(str(discord_id).strip())
+        except ValueError:
+            continue
+
+        member = guild.get_member(discord_id_int)
+        if member is None:
+            try:
+                member = await guild.fetch_member(discord_id_int)
+            except discord.HTTPException:
+                continue  # このサーバーにいない人
+
+        if member.bot:
+            continue
+
+        result["targets"] += 1
+
+        if role in member.roles:
+            result["already"] += 1
+            continue
+
+        try:
+            await member.add_roles(role, reason="スプレッドシートとの紐づけが完了しているため")
+            result["granted"] += 1
+        except discord.HTTPException as error:
+            result["failed"] += 1
+            if result["error"] is None:
+                result["error"] = f"{member.display_name}：{error}"
+            print(f"「{MEMBER_ROLE_NAME}」ロールを {member}（{member.id}）に付与できませんでした：{error}")
+
+    return result
+
+
+def _format_role_result(role_result: dict) -> list[str]:
+    """会員ロール付与の結果を、id同期の結果メッセージ用の行に整形する（常に1行以上出す）。"""
+    if role_result["role_missing"]:
+        return [
+            f"⚠️「{MEMBER_ROLE_NAME}」という名前のロールが見つからないため、"
+            "ロール付与をスキップしました。先にDiscord側でロールを作成してください。"
+        ]
+
+    lines = [
+        f"🎫 「{MEMBER_ROLE_NAME}」ロール：対象{role_result['targets']}人 / "
+        f"今回付与{role_result['granted']}人 / 付与済み{role_result['already']}人 / "
+        f"失敗{role_result['failed']}人"
+    ]
+    if role_result["error"]:
+        lines.append(f"⚠️ エラー内容：{role_result['error']}")
+        lines.append(
+            f"（Botの「ロールの管理」権限、Botのロールが「{MEMBER_ROLE_NAME}」より上にあるかを確認してください）"
+        )
+    return lines
+
+
 async def _finish_registration(member: discord.Member):
     """
     本名登録が完了したメンバーの制限を解除する。
-    「未登録」ロールを外し、名前登録チャンネルに一時的に付与していた
-    本人専用の閲覧権限も片付ける。
+    「未登録」ロールを外して「会員」ロールを付与し、名前登録チャンネルに
+    一時的に付与していた本人専用の閲覧権限も片付ける。
     """
     await _remove_unverified_role(member)
+    await _grant_member_role(member)
 
     register_channel = discord.utils.get(member.guild.text_channels, name=NAME_REGISTER_CHANNEL_NAME)
     if register_channel is not None:
@@ -167,6 +296,13 @@ async def run_id_sync(guild: discord.Guild, send):
         lines.append("👤 Discordにいるがシートで一致しなかった表示名：")
         lines.append("、".join(result["unmatched_discord_names"]))
 
+    # 紐づけが完了している人（今回一致した人＋以前から紐づけ済みだった人）全員に
+    # 「会員」ロールを付与する（本番移行時の既存会員への一括付与もここで行われる）
+    # 同期処理が特定した「サーバー内にいて紐づけ済み」のメンバーIDをそのまま使う
+    role_result = await _grant_member_role_to_linked(guild, result.get("linked_discord_ids"))
+    lines.append("")
+    lines.extend(_format_role_result(role_result))
+
     # 「Discordにいるがシートで一致しなかった表示名」がある場合だけ、
     # 管理者ロールにメンションして気づきやすくする
     # （候補が複数・シート側だけの未一致は既存データに大量にあるため対象外にする）
@@ -197,7 +333,10 @@ async def run_id_sync(guild: discord.Guild, send):
 @commands.has_permissions(administrator=True)
 async def sync_ids(ctx: commands.Context):
     """管理者がチャンネルで「!id同期」と打った時に手動で実行するコマンド。"""
-    await ctx.send("Discordメンバーとスプレッドシートを突き合わせています…（少し時間がかかります）")
+    await ctx.send(
+        f"Discordメンバーとスプレッドシートを突き合わせています…（少し時間がかかります）\n"
+        f"（bot バージョン：{BOT_VERSION}）"
+    )
     await run_id_sync(ctx.guild, ctx.send)
 
 
@@ -230,6 +369,73 @@ async def setup_unverified_role(ctx: commands.Context):
     message = f"✅ {count}件のチャンネルを「{UNVERIFIED_ROLE_NAME}」ロールから見えないようにしました。"
     if failed:
         message += f"\n⚠️ {failed}件は権限不足のため設定できませんでした。"
+    await ctx.send(message)
+
+
+@bot.command(name="会員ロール設定")
+@commands.has_permissions(administrator=True)
+async def setup_member_role(ctx: commands.Context):
+    """
+    「会員」ロールを持つ人だけが見られるように、マッチングルーム・承認チャンネル
+    （環境変数 MEMBER_ONLY_CHANNEL_NAMES で追加可）の権限をまとめて設定する管理者向けコマンド
+    （許可リスト方式：@everyoneを非表示にし、「会員」ロールにだけ閲覧を許可する）。
+
+    あわせて「名前登録」チャンネルも@everyoneから見えないようにする
+    （新規参加者には参加時に本人にだけ個別で閲覧権限を付与しているため、
+      @everyoneを非表示にしておかないと登録前の人にも全員に見えてしまう）。
+
+    さらに、スプレッドシートと連携済み（＝すでに本名登録済み）の既存会員にも
+    「会員」ロールを一括付与する（このロールがないと、切り替え後にマッチングルーム等が
+    見えなくなってしまうため）。
+
+    「会員」ロール自体は先にDiscord側で作成しておいてください。
+    チャンネル構成を変えた時は、このコマンドを再実行してください。
+    """
+    role = discord.utils.get(ctx.guild.roles, name=MEMBER_ROLE_NAME)
+    if role is None:
+        await ctx.send(f"「{MEMBER_ROLE_NAME}」という名前のロールが見つかりませんでした。先にロールを作成してください。")
+        return
+
+    await ctx.send("チャンネル権限を設定しています…（少し時間がかかります）")
+
+    count = 0
+    failed = 0
+
+    # マッチングルーム・承認などは「会員」ロールだけが見られるようにする
+    for channel_name in MEMBER_ONLY_CHANNEL_NAMES:
+        channel = discord.utils.get(ctx.guild.text_channels, name=channel_name)
+        if channel is None:
+            print(f"「{channel_name}」という名前のテキストチャンネルが見つかりませんでした。")
+            failed += 1
+            continue
+        try:
+            await channel.set_permissions(ctx.guild.default_role, view_channel=False)
+            await channel.set_permissions(role, view_channel=True)
+            count += 1
+        except discord.Forbidden:
+            failed += 1
+
+    # 名前登録チャンネルは@everyoneから見えないようにする
+    # （参加時に本人にだけ個別で閲覧権限を付与する方式のため）
+    register_channel = discord.utils.get(ctx.guild.text_channels, name=NAME_REGISTER_CHANNEL_NAME)
+    if register_channel is not None:
+        try:
+            await register_channel.set_permissions(ctx.guild.default_role, view_channel=False)
+            count += 1
+        except discord.Forbidden:
+            failed += 1
+    else:
+        print(f"「{NAME_REGISTER_CHANNEL_NAME}」という名前のテキストチャンネルが見つかりませんでした。")
+        failed += 1
+
+    await ctx.send("既存の会員（スプレッドシート連携済み）に「会員」ロールを付与しています…")
+
+    role_result = await _grant_member_role_to_linked(ctx.guild)
+
+    message = f"✅ {count}件のチャンネルに権限を設定しました。"
+    if failed:
+        message += f"\n⚠️ {failed}件のチャンネルは見つからない、または権限不足のため設定できませんでした。"
+    message += "\n" + "\n".join(_format_role_result(role_result))
     await ctx.send(message)
 
 
@@ -676,10 +882,12 @@ class NameRegisterView(discord.ui.View):
 async def on_member_join(member: discord.Member):
     """
     新しいメンバーがサーバーに参加したら、
-    1. 「未登録」ロールを付与する（名前登録が終わるまで他のチャンネルを見せないため）
+    1. 「未登録」ロールを付与する
     2. 「名前登録」チャンネルへの閲覧権限を本人にだけ一時的に付与し、
        そのチャンネル内でメンション付きの案内メッセージを送る（DMは使わない）
-    3. 自動で「id同期」も実行する（すでにシートに名前がある人を拾うため）
+
+    参加直後の自動id同期は行わない（id同期ログが毎回動いてしまうのを避けるため）。
+    自動同期は、ニックネームを変更した時（on_member_update）にのみ実行される。
     """
     guild = member.guild
 
@@ -708,19 +916,6 @@ async def on_member_join(member: discord.Member):
         )
     else:
         print(f"「{NAME_REGISTER_CHANNEL_NAME}」という名前のテキストチャンネルが見つかりませんでした。")
-
-    channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
-
-    async def send(*args, **kwargs):
-        if channel is not None:
-            await channel.send(*args, **kwargs)
-        else:
-            print(f"「{ID_SYNC_LOG_CHANNEL_NAME}」チャンネルが見つからないため、id同期の結果を送信できませんでした。")
-
-    if channel is not None:
-        await channel.send(f"👋 {member.mention} さんが参加しました。DiscordIDの自動突き合わせを行います…")
-
-    await run_id_sync(guild, send)
 
 
 @bot.event

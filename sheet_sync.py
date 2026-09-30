@@ -100,6 +100,7 @@ def sync_discord_ids(guild_members: list[tuple[str, str]]) -> dict:
       ambiguous_names       : 候補が複数人いたためスキップした名前
       unmatched_sheet_names : シートにあるがDiscordで一致しなかった名前
       unmatched_discord_names: Discordにいるがシートで一致しなかった表示名
+      linked_discord_ids    : サーバー内にいてシートと紐づいているメンバーのID
     """
     spreadsheet_id = os.getenv("SPREADSHEET_ID")
     sheet_name = os.getenv("SHEET_NAME", "会員")
@@ -173,11 +174,18 @@ def sync_discord_ids(guild_members: list[tuple[str, str]]) -> dict:
         if discord_id not in used_discord_ids
     )
 
+    # サーバー内にいて、かつシートと紐づいている（既存・今回新規の両方）メンバーのID。
+    # 「会員」ロールの付与対象としてBot側で使う。
+    linked_discord_ids = sorted(
+        discord_id for discord_id, _ in guild_members if discord_id in used_discord_ids
+    )
+
     return {
         "matched": len(updates),
         "ambiguous_names": sorted(ambiguous_names),
         "unmatched_sheet_names": unmatched_sheet_names,
         "unmatched_discord_names": unmatched_discord_names,
+        "linked_discord_ids": linked_discord_ids,
     }
 
 
