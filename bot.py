@@ -25,7 +25,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-09-30b 会員ロール診断版"
+BOT_VERSION = "2026-09-30e 案内メッセージ自動削除版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -194,10 +194,45 @@ async def _finish_registration(member: discord.Member):
 
     register_channel = discord.utils.get(member.guild.text_channels, name=NAME_REGISTER_CHANNEL_NAME)
     if register_channel is not None:
+        # 本人宛ての「ようこそ！名前を登録してください」メッセージは、登録が終わったら不要なので削除する
+        await _delete_welcome_messages(register_channel, member)
         try:
             await register_channel.set_permissions(member, overwrite=None)
         except discord.Forbidden:
             pass
+
+
+async def _delete_welcome_messages(channel: discord.TextChannel, member: discord.Member):
+    """名前登録チャンネルにある、Botがこのメンバー宛てに送った案内メッセージを削除する。"""
+    try:
+        async for message in channel.history(limit=200):
+            if message.author.id == channel.guild.me.id and member in message.mentions:
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
+    except discord.HTTPException:
+        pass
+
+
+def is_admin():
+    """
+    管理者コマンドを実行できるかのチェック。
+    Discordの「管理者」権限を持っている人に加えて、「管理者」ロール（ADMIN_ROLE_NAME）を
+    持っている人も実行できるようにする。
+    （「管理者」権限を持つと他人のマッチングルームまで全部見えてしまうため、
+      権限は外してロールだけで管理者扱いにする運用に対応するため）
+    """
+
+    async def predicate(ctx: commands.Context) -> bool:
+        if ctx.guild is None:
+            return False
+        author = ctx.author
+        if author.guild_permissions.administrator:
+            return True
+        return any(role.name == ADMIN_ROLE_NAME for role in getattr(author, "roles", []))
+
+    return commands.check(predicate)
 
 
 def run_coro(coro, timeout: int = 15):
@@ -330,7 +365,7 @@ async def run_id_sync(guild: discord.Guild, send):
 
 
 @bot.command(name="id同期")
-@commands.has_permissions(administrator=True)
+@is_admin()
 async def sync_ids(ctx: commands.Context):
     """管理者がチャンネルで「!id同期」と打った時に手動で実行するコマンド。"""
     await ctx.send(
@@ -341,7 +376,7 @@ async def sync_ids(ctx: commands.Context):
 
 
 @bot.command(name="未登録ロール設定")
-@commands.has_permissions(administrator=True)
+@is_admin()
 async def setup_unverified_role(ctx: commands.Context):
     """
     「未登録」ロールから、サーバー内のすべてのチャンネルを見えなくする権限設定を
@@ -373,7 +408,7 @@ async def setup_unverified_role(ctx: commands.Context):
 
 
 @bot.command(name="会員ロール設定")
-@commands.has_permissions(administrator=True)
+@is_admin()
 async def setup_member_role(ctx: commands.Context):
     """
     「会員」ロールを持つ人だけが見られるように、マッチングルーム・承認チャンネル
@@ -440,7 +475,7 @@ async def setup_member_role(ctx: commands.Context):
 
 
 @bot.command(name="マッチング解除")
-@commands.has_permissions(administrator=True)
+@is_admin()
 async def unmatch(ctx: commands.Context, member_a: discord.Member, member_b: discord.Member):
     """
     2人のマッチング成立記録を取り消す（テストのやり直し用）管理者向けコマンド。
@@ -468,7 +503,7 @@ async def unmatch(ctx: commands.Context, member_a: discord.Member, member_b: dis
 
 
 @bot.command(name="マッチング復元")
-@commands.has_permissions(administrator=True)
+@is_admin()
 async def restore_matches(ctx: commands.Context):
     """
     既存の「2人だけが見えるプライベートなテキストチャンネル」をスキャンして、
@@ -519,6 +554,40 @@ async def restore_matches(ctx: commands.Context):
         f"✅ プライベートルームを{len(found_pairs)}件検出し、"
         f"うち{added}件を新たにマッチング履歴へ追加しました。"
     )
+
+
+@bot.command(name="マッチングルーム整理")
+@is_admin()
+async def organize_match_rooms(ctx: commands.Context):
+    """
+    既存のマッチングルーム（2人だけが見えるプライベートチャンネル）を、
+    専用カテゴリ（MATCH_CATEGORY_NAME）の中へまとめて移動する管理者向けコマンド。
+    新しく作られるマッチングルームは最初から専用カテゴリに入るので、実行は最初の1回でOK。
+    各ルームの閲覧権限（2人だけが見える設定）はそのまま維持される。
+    """
+    await ctx.send("既存のマッチングルームを専用カテゴリへ移動しています…（少し時間がかかります）")
+
+    moved = 0
+    failed = 0
+    for channel in list(ctx.guild.text_channels):
+        if channel.category is not None and match_views._is_match_category(channel.category):
+            continue  # すでに専用カテゴリ内
+        if match_views.is_private_match_room(channel) is None:
+            continue  # マッチングルームではない
+
+        try:
+            category = await match_views.get_match_category(ctx.guild)
+            # sync_permissions=False：カテゴリの権限に上書きされず、2人だけが見える設定を維持する
+            await channel.edit(category=category, sync_permissions=False)
+            moved += 1
+        except discord.HTTPException as error:
+            failed += 1
+            print(f"「{channel.name}」の移動に失敗しました：{error}")
+
+    message = f"✅ {moved}件のマッチングルームを「{match_views.MATCH_CATEGORY_NAME}」へ移動しました。"
+    if failed:
+        message += f"\n⚠️ {failed}件は移動に失敗しました（Botの「チャンネルの管理」権限を確認してください）。"
+    await ctx.send(message)
 
 
 class NameModal(discord.ui.Modal, title="本名を登録"):

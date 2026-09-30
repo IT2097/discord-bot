@@ -39,8 +39,8 @@ HEADER_URL_2 = "URL②"
 HEADER_URL_3 = "URL③"
 CACHE_SECONDS = 300  # スプレッドシートを毎回読みに行かず、5分間だけ結果をキャッシュする
 
-# 業種のプルダウン選択肢を読み込む「設定」シートの名前・見出し名
-BUSINESS_TYPE_SETTINGS_SHEET_NAME = os.getenv("BUSINESS_TYPE_SETTINGS_SHEET_NAME", "設定")
+# 業種のプルダウン選択肢を読み込む「設定用」シートの名前・見出し名
+BUSINESS_TYPE_SETTINGS_SHEET_NAME = os.getenv("BUSINESS_TYPE_SETTINGS_SHEET_NAME", "設定用")
 BUSINESS_TYPE_SETTINGS_HEADER = os.getenv("BUSINESS_TYPE_SETTINGS_HEADER", "業種1")
 
 # get_all_records() に明示的に渡す想定ヘッダー。
@@ -212,7 +212,7 @@ def _fetch_business_type_options() -> list[str]:
 
 def get_business_type_options(force_refresh: bool = False) -> list[str]:
     """
-    「設定」シートの「業種1」列から、業種のプルダウン選択肢を取得する
+    「設定用」シートの「業種1」列から、業種のプルダウン選択肢を取得する
     （短時間キャッシュ付き）。
     """
     with _lock:
