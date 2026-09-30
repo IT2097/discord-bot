@@ -214,10 +214,26 @@ def append_new_member_rows(base_profile: dict, businesses: list[dict]) -> None:
     sheet = client.open_by_key(spreadsheet_id).worksheet(sheet_name)
 
     headers = sheet.row_values(1)
-    rows_to_add = []
+
+    # 書き込み先の先頭行＝「名前（本名）」列で最後に値が入っている行の次の行。
+    # （A列のARRAYFORMULAのように数式で埋まっている列は基準にしない）
+    if sheets_client.HEADER_NAME not in headers:
+        raise RuntimeError(f"シートに「{sheets_client.HEADER_NAME}」という見出しの列が見つかりませんでした。")
+    name_col = headers.index(sheets_client.HEADER_NAME) + 1
+    start_row = len(sheet.col_values(name_col)) + 1
+
+    # 行数が足りなければシートの末尾に行を足す
+    needed_last_row = start_row + len(businesses) - 1
+    if needed_last_row > sheet.row_count:
+        sheet.add_rows(needed_last_row - sheet.row_count)
+
+    # 値の入るセルだけを個別に書き込む。
+    # 空欄のセル（特にA列など数式で自動計算している列）には一切書き込まないことで、
+    # ARRAYFORMULAの展開を邪魔して「#REF!」エラーになるのを防ぐ。
+    cell_updates = []
 
     for index, biz in enumerate(businesses):
-        new_row = [""] * len(headers)
+        row_number = start_row + index
         field_map = {
             sheets_client.HEADER_NAME: base_profile.get("name", ""),
             # DiscordIDは最初の行にだけ入れる（既存の複数行会員データの形式に合わせる）
@@ -232,8 +248,10 @@ def append_new_member_rows(base_profile: dict, businesses: list[dict]) -> None:
 
         for header, value in field_map.items():
             if header in headers and value:
-                new_row[headers.index(header)] = value
+                col = headers.index(header) + 1
+                cell_updates.append(
+                    {"range": gspread.utils.rowcol_to_a1(row_number, col), "values": [[value]]}
+                )
 
-        rows_to_add.append(new_row)
-
-    sheet.append_rows(rows_to_add)
+    # RAW：DiscordIDのような長い数字が指数表記・桁落ちしないよう、入力値をそのまま文字として書き込む
+    sheet.batch_update(cell_updates, value_input_option="RAW")

@@ -25,7 +25,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-09-30f 名前登録フロー修正版"
+BOT_VERSION = "2026-09-30g 業種セット入力版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -51,6 +51,15 @@ ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "管理者")
 # 「未登録ロールを禁止する」方式（deny方式）は設定漏れがあると素通しで見えてしまうため、
 # こちらのより確実な方式に切り替える。
 MEMBER_ROLE_NAME = os.getenv("MEMBER_ROLE_NAME", "会員")
+
+# Botが自分で投稿・管理するチャンネル（承認・マッチングルーム・名前登録）に付けるBot用の権限
+BOT_CHANNEL_PERMISSIONS = dict(
+    view_channel=True,
+    send_messages=True,
+    read_message_history=True,
+    embed_links=True,
+    manage_messages=True,
+)
 
 # 「会員」ロールを持つ人だけに表示するチャンネル名（カンマ区切りで環境変数からも追加できる）
 MEMBER_ONLY_CHANNEL_NAMES = [
@@ -444,10 +453,13 @@ async def setup_member_role(ctx: commands.Context):
             failed += 1
             continue
         try:
+            # 先にBot自身の閲覧・投稿を許可しておく（@everyoneを非表示にした瞬間に
+            # Bot自身も見えなくなり、承認メッセージの投稿などが403エラーになるのを防ぐ）
+            await channel.set_permissions(ctx.guild.me, **BOT_CHANNEL_PERMISSIONS)
             await channel.set_permissions(ctx.guild.default_role, view_channel=False)
             await channel.set_permissions(role, view_channel=True)
             count += 1
-        except discord.Forbidden:
+        except discord.HTTPException:
             failed += 1
 
     # 名前登録チャンネルは@everyoneから見えないようにする
@@ -455,6 +467,7 @@ async def setup_member_role(ctx: commands.Context):
     register_channel = discord.utils.get(ctx.guild.text_channels, name=NAME_REGISTER_CHANNEL_NAME)
     if register_channel is not None:
         try:
+            await register_channel.set_permissions(ctx.guild.me, **BOT_CHANNEL_PERMISSIONS)
             await register_channel.set_permissions(ctx.guild.default_role, view_channel=False)
             count += 1
         except discord.Forbidden:
@@ -695,24 +708,6 @@ AGE_OPTIONS = ["10代", "20代", "30代", "40代", "50代", "60代", "70代以�
 GENDER_OPTIONS = ["男性", "女性", "その他"]
 
 
-class BusinessTypeSelect(discord.ui.Select):
-    """
-    業種の選択肢（スプレッドシートの「設定」シート「業種1」列から取得）。
-    Discordのプルダウンは1つにつき最大25個までのため、超える分は先頭25個に絞る。
-    選択した値は .values からいつでも読み取れるようにするだけで、
-    特別な処理は行わない（選択の確定だけAcknowledgeする）。
-    """
-
-    def __init__(self, options: list[str]):
-        super().__init__(
-            placeholder="業種を選択",
-            options=[discord.SelectOption(label=option) for option in options[:25]],
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-
-
 class ProfileBasicsView(discord.ui.View):
     """
     新規会員のプロフィール入力（1/3）。年齢・性別をプルダウンで選んでもらい、
@@ -805,65 +800,75 @@ class ProfileLocationModal(discord.ui.Modal, title="プロフィール入力（�
 
 class BusinessEntryView(discord.ui.View):
     """
-    新規会員のプロフィール入力（3/3）。業種を選んで「業種を追加」を押すと
-    事業/活動内容の入力フォームが開き、業種とセットで1件ずつ登録できる。
-    何度でも追加でき、「登録を完了する」でスプレッドシートに書き込む
-    （追加した業種の数だけ複数行に分かれて書き込まれる）。
+    新規会員のプロフィール入力（3/3）。
+    「業種と事業内容を追加」を押すと、業種（プルダウン）と事業/活動内容（文章）を
+    1つのフォームでセットで入力できる。複数ある場合は同じボタンで何件でも追加でき、
+    「登録を完了する」でスプレッドシートに書き込む（追加した件数だけ行が分かれる）。
     """
 
     def __init__(self, member_id: int, base_profile: dict, business_type_options: list[str]):
         super().__init__(timeout=900)
         self.member_id = member_id
         self.base_profile = base_profile
+        self.business_type_options = business_type_options
         self.businesses: list[dict] = []
+        self._refresh_buttons()
 
-        self.type_select = BusinessTypeSelect(business_type_options)
-        self.add_item(self.type_select)
+    def _refresh_buttons(self):
+        # 1件目は「追加」、2件目以降は「もう1件追加」と表示を変えて分かりやすくする
+        self.add_business.label = (
+            "業種と事業内容を追加する" if not self.businesses else "もう1件、業種と事業内容を追加する"
+        )
+        self.remove_last.disabled = not self.businesses
+        self.finish.disabled = not self.businesses
 
     def summary_text(self) -> str:
         if not self.businesses:
             listing = "（まだありません）"
         else:
             listing = "\n".join(
-                f"{i + 1}. {biz['type']}：{biz['content']}" for i, biz in enumerate(self.businesses)
+                f"{i + 1}. 【{biz['type']}】{biz['content']}" for i, biz in enumerate(self.businesses)
             )
         return (
-            "業種を選択して「業種を追加」を押すと、事業/活動内容を入力できます。\n"
-            "複数の業種がある場合は、繰り返し追加してください。\n"
+            "最後に、業種と事業/活動内容を登録します。\n"
+            "「業種と事業内容を追加する」を押すと、業種の選択と事業/活動内容の入力を"
+            "1つのフォームでまとめて行えます。\n"
+            "複数ある場合は、同じように1件ずつ追加してください。\n"
             "すべて入力したら「登録を完了する」を押してください。\n\n"
-            f"【現在登録した業種】\n{listing}"
+            f"【登録する業種と事業内容】\n{listing}"
         )
 
-    @discord.ui.button(label="業種を追加", style=discord.ButtonStyle.secondary)
+    async def _check_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.member_id:
+            await interaction.response.send_message(
+                "この登録フォームはあなた宛てではありません。", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="業種と事業内容を追加する", style=discord.ButtonStyle.success, row=0)
     async def add_business(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.member_id:
-            await interaction.response.send_message(
-                "この登録フォームはあなた宛てではありません。", ephemeral=True
-            )
+        if not await self._check_owner(interaction):
             return
+        await interaction.response.send_modal(BusinessPairModal(parent_view=self))
 
-        selected = self.type_select.values[0] if self.type_select.values else None
-        if not selected:
-            await interaction.response.send_message(
-                "先に業種を選択してから「業種を追加」を押してください。", ephemeral=True
-            )
+    @discord.ui.button(label="最後の1件を取り消す", style=discord.ButtonStyle.secondary, row=0)
+    async def remove_last(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_owner(interaction):
             return
+        if self.businesses:
+            self.businesses.pop()
+        self._refresh_buttons()
+        await interaction.response.edit_message(content=self.summary_text(), view=self)
 
-        await interaction.response.send_modal(
-            BusinessContentModal(parent_view=self, business_type=selected)
-        )
-
-    @discord.ui.button(label="登録を完了する", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="登録を完了する", style=discord.ButtonStyle.primary, row=1)
     async def finish(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.member_id:
-            await interaction.response.send_message(
-                "この登録フォームはあなた宛てではありません。", ephemeral=True
-            )
+        if not await self._check_owner(interaction):
             return
 
         if not self.businesses:
             await interaction.response.send_message(
-                "業種を1件も追加していません。「業種を追加」から少なくとも1件入力してください。",
+                "業種と事業内容を1件も追加していません。少なくとも1件追加してください。",
                 ephemeral=True,
             )
             return
@@ -906,28 +911,47 @@ class BusinessEntryView(discord.ui.View):
         )
 
 
-class BusinessContentModal(discord.ui.Modal, title="事業/活動内容を入力"):
+class BusinessPairModal(discord.ui.Modal, title="業種と事業/活動内容を追加"):
     """
-    「業種を追加」ボタンから開くフォーム。事業/活動内容だけを入力してもらい、
-    選択済みの業種とセットにして元の一覧に追加する。
+    業種（プルダウン）と事業/活動内容（文章）を1つのフォームでセットで入力してもらう。
+    業種の選択肢はスプレッドシートの「設定用」シート「業種1」列から取得した値
+    （Discordのプルダウンは最大25個までのため、超える分は先頭25個に絞る）。
     """
 
-    content = discord.ui.TextInput(
-        label="事業/活動内容",
-        style=discord.TextStyle.paragraph,
-        placeholder="例：カフェの経営",
-        max_length=200,
-    )
-
-    def __init__(self, parent_view: BusinessEntryView, business_type: str):
+    def __init__(self, parent_view: BusinessEntryView):
         super().__init__()
         self.parent_view = parent_view
-        self.business_type = business_type
+
+        self.type_select = discord.ui.Select(
+            placeholder="業種を選択してください",
+            options=[
+                discord.SelectOption(label=option[:100], value=option[:100])
+                # 同じ業種が重複しているとDiscord側でエラーになるため重複を除く
+                for option in list(dict.fromkeys(o[:100] for o in parent_view.business_type_options))[:25]
+            ],
+            min_values=1,
+            max_values=1,
+        )
+        self.content_input = discord.ui.TextInput(
+            style=discord.TextStyle.paragraph,
+            placeholder="例：カフェの経営",
+            max_length=200,
+        )
+        self.add_item(discord.ui.Label(text="業種", component=self.type_select))
+        self.add_item(
+            discord.ui.Label(
+                text="事業/活動内容",
+                description="上で選んだ業種で、どんな事業・活動をしているか",
+                component=self.content_input,
+            )
+        )
 
     async def on_submit(self, interaction: discord.Interaction):
+        business_type = self.type_select.values[0] if self.type_select.values else ""
         self.parent_view.businesses.append(
-            {"type": self.business_type, "content": self.content.value.strip()}
+            {"type": business_type, "content": self.content_input.value.strip()}
         )
+        self.parent_view._refresh_buttons()
         await interaction.response.edit_message(
             content=self.parent_view.summary_text(), view=self.parent_view
         )
@@ -969,7 +993,7 @@ async def _view_on_error(self, interaction: discord.Interaction, error: Exceptio
     await _report_interaction_error(interaction, error)
 
 
-for _modal_cls in (NameModal, ProfileLocationModal, BusinessContentModal):
+for _modal_cls in (NameModal, ProfileLocationModal, BusinessPairModal):
     _modal_cls.on_error = _modal_on_error
 for _view_cls in (ProfileBasicsView, BusinessEntryView, NameRegisterView):
     _view_cls.on_error = _view_on_error

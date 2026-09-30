@@ -1,4 +1,4 @@
-discord.py>=2.4.0
+discord.py>=2.6.0
 Flask>=3.0.0
 requests>=2.31.0
 gspread>=6.1.0

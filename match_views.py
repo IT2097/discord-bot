@@ -16,6 +16,61 @@ GUILD_ID = os.getenv("GUILD_ID")
 # マッチング申請の承認メッセージを投稿するテキストチャンネル名
 APPROVAL_CHANNEL_NAME = os.getenv("APPROVAL_CHANNEL_NAME", "承認")
 
+# マッチングルームをまとめて入れるカテゴリ名。
+# オーナーはこのカテゴリをミュート＋「ミュートしたチャンネルを非表示」にすることで、
+# 他人のマッチングルームをサイドバーに出さないようにできる。
+# Discordは1カテゴリに最大50チャンネルまでのため、埋まったら「〇〇 2」「〇〇 3」…を自動で作る。
+MATCH_CATEGORY_NAME = os.getenv("MATCH_CATEGORY_NAME", "マッチングルーム一覧")
+_CATEGORY_CHANNEL_LIMIT = 50
+
+
+def _is_match_category(category: discord.CategoryChannel) -> bool:
+    name = category.name
+    if name == MATCH_CATEGORY_NAME:
+        return True
+    prefix = f"{MATCH_CATEGORY_NAME} "
+    return name.startswith(prefix) and name[len(prefix):].isdigit()
+
+
+async def get_match_category(guild: discord.Guild) -> discord.CategoryChannel:
+    """
+    マッチングルームを入れるカテゴリを返す（空きのある既存カテゴリ、無ければ新規作成）。
+    カテゴリ自体も@everyoneからは見えないようにしておく。
+    """
+    categories = sorted(
+        (c for c in guild.categories if _is_match_category(c)), key=lambda c: c.position
+    )
+    for category in categories:
+        if len(category.channels) < _CATEGORY_CHANNEL_LIMIT:
+            return category
+
+    name = MATCH_CATEGORY_NAME if not categories else f"{MATCH_CATEGORY_NAME} {len(categories) + 1}"
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True),
+    }
+    return await guild.create_category(name=name, overwrites=overwrites)
+
+
+def is_private_match_room(channel: discord.TextChannel) -> list[str] | None:
+    """
+    「@everyoneは見えない」かつ「Bot以外の個人2人だけが明示的に見える」チャンネルなら、
+    その2人のIDを返す（マッチングルームとみなす）。違えば None。
+    """
+    guild = channel.guild
+    member_ids = []
+    default_denied = False
+    for target, overwrite in channel.overwrites.items():
+        if target == guild.default_role:
+            if overwrite.view_channel is False:
+                default_denied = True
+            continue
+        if isinstance(target, discord.Member) and not target.bot and overwrite.view_channel is True:
+            member_ids.append(str(target.id))
+    if default_denied and len(member_ids) == 2:
+        return member_ids
+    return None
+
 
 def _format_profile(member: dict) -> str:
     """
@@ -99,9 +154,16 @@ async def create_match_channel(
         ),
     }
 
+    # 専用カテゴリにまとめて作る（取得に失敗してもルーム作成自体は続行する）
+    try:
+        category = await get_match_category(guild)
+    except discord.HTTPException:
+        category = None
+
     channel = await guild.create_text_channel(
         name=f"{member_a.display_name}-{member_b.display_name}",
         overwrites=overwrites,
+        category=category,
     )
 
     await channel.send(f"{member_a.mention} と {member_b.mention} のマッチングルームです！")
@@ -327,8 +389,15 @@ async def send_match_request_to_channel(bot: discord.Client, requester_id: str, 
     target = await guild.fetch_member(int(target_id))
 
     view = MatchApproveView(bot, request_id)
-    await channel.send(
-        f"{target.mention}\n{requester.display_name} さんからマッチの依頼が来ました！承認しますか？\n"
-        "（「プロフィール」ボタンから相手の情報を確認できます）",
-        view=view,
-    )
+    try:
+        await channel.send(
+            f"{target.mention}\n{requester.display_name} さんからマッチの依頼が来ました！承認しますか？\n"
+            "（「プロフィール」ボタンから相手の情報を確認できます）",
+            view=view,
+        )
+    except discord.Forbidden as error:
+        raise RuntimeError(
+            f"Botが「{APPROVAL_CHANNEL_NAME}」チャンネルを見る・投稿する権限を持っていません。"
+            "管理者の方は !会員ロール設定 を再実行するか、チャンネルの権限でBotに"
+            "「チャンネルを見る」「メッセージを送信」を許可してください。"
+        ) from error
