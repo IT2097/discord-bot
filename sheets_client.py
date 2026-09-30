@@ -198,14 +198,25 @@ def _fetch_business_type_options() -> list[str]:
             f"「{BUSINESS_TYPE_SETTINGS_SHEET_NAME}」という名前のシートが見つかりませんでした。"
         ) from error
 
+    import unicodedata
+
+    def _norm(text: str) -> str:
+        # 全角/半角（「業種１」と「業種1」など）や前後・途中の空白の違いを吸収して比較する
+        return "".join(unicodedata.normalize("NFKC", str(text)).split())
+
     header_row = sheet.row_values(1)
-    if BUSINESS_TYPE_SETTINGS_HEADER not in header_row:
+    target = _norm(BUSINESS_TYPE_SETTINGS_HEADER)
+    normalized_headers = [_norm(h) for h in header_row]
+
+    if target not in normalized_headers:
+        found = "、".join(h for h in header_row if str(h).strip()) or "（1行目が空です）"
         raise RuntimeError(
-            f"「{BUSINESS_TYPE_SETTINGS_SHEET_NAME}」シートに"
+            f"「{BUSINESS_TYPE_SETTINGS_SHEET_NAME}」シートの1行目に"
             f"「{BUSINESS_TYPE_SETTINGS_HEADER}」という見出しの列が見つかりませんでした。"
+            f"（1行目にある見出し：{found}）"
         )
 
-    col_index = header_row.index(BUSINESS_TYPE_SETTINGS_HEADER) + 1
+    col_index = normalized_headers.index(target) + 1
     column_values = sheet.col_values(col_index)[1:]  # 1行目（見出し）を除く
     return [value.strip() for value in column_values if value.strip()]
 
