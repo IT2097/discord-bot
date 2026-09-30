@@ -25,7 +25,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-09-30e 案内メッセージ自動削除版"
+BOT_VERSION = "2026-09-30f 名前登録フロー修正版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -681,14 +681,13 @@ class NameModal(discord.ui.Modal, title="本名を登録"):
             return
 
         # 既存の行が見つからなかった新規会員には、続けてプロフィールを入力してもらう
-        state = RegistrationState(
-            member_id=member.id, name=full_name, business_type_options=business_type_options
-        )
         await interaction.followup.send(
             "会員情報が見つからなかったため、続けてプロフィールを入力してください。\n"
             "まずは年齢・性別を選んで「次へ」を押してください。",
             ephemeral=True,
-            view=ProfileBasicsView(state),
+            view=ProfileBasicsView(
+                member_id=member.id, name=full_name, business_type_options=business_type_options
+            ),
         )
 
 
@@ -945,6 +944,35 @@ class NameRegisterView(discord.ui.View):
     )
     async def register(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(NameModal())
+
+
+async def _report_interaction_error(interaction: discord.Interaction, error: Exception):
+    """登録フォーム・ボタンで想定外のエラーが起きた時に、黙って止まらず本人に知らせる。"""
+    import traceback
+
+    traceback.print_exception(type(error), error, error.__traceback__)
+    message = f"処理中にエラーが発生しました：{error}\nお手数ですが管理者に連絡してください。"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+async def _modal_on_error(self, interaction: discord.Interaction, error: Exception):
+    await _report_interaction_error(interaction, error)
+
+
+async def _view_on_error(self, interaction: discord.Interaction, error: Exception, item):
+    await _report_interaction_error(interaction, error)
+
+
+for _modal_cls in (NameModal, ProfileLocationModal, BusinessContentModal):
+    _modal_cls.on_error = _modal_on_error
+for _view_cls in (ProfileBasicsView, BusinessEntryView, NameRegisterView):
+    _view_cls.on_error = _view_on_error
 
 
 @bot.event
