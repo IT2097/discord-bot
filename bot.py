@@ -25,7 +25,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-09-30g 業種セット入力版"
+BOT_VERSION = "2026-10-03 登録誘導版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -104,6 +104,8 @@ async def _grant_member_role_to_linked(guild: discord.Guild, linked_ids: list[st
     今回新たに一致した人だけでなく、以前から紐づけ済みだった人
     （本番移行時にすでに参加している何十人もの既存会員など）にも
     もれなくロールが行き渡るようにする。
+    あわせて「未登録」ロールが残っていれば外す
+    （ニックネーム変更による自動同期で紐づいた人が、一般チャンネルを見られないままになるのを防ぐ）。
 
     戻り値：
       role_missing  … 「会員」ロールがサーバーに存在しない（先に作成が必要）
@@ -154,6 +156,9 @@ async def _grant_member_role_to_linked(guild: discord.Guild, linked_ids: list[st
             continue
 
         result["targets"] += 1
+
+        # 紐づけが済んでいる人に「未登録」ロールが残っていれば外す
+        await _remove_unverified_role(member)
 
         if role in member.roles:
             result["already"] += 1
@@ -414,6 +419,40 @@ async def setup_unverified_role(ctx: commands.Context):
     if failed:
         message += f"\n⚠️ {failed}件は権限不足のため設定できませんでした。"
     await ctx.send(message)
+
+
+@bot.command(name="未登録ロール一括付与")
+@is_admin()
+async def bulk_assign_unverified(ctx: commands.Context):
+    """
+    「会員」ロールが無い既存メンバーに「未登録」ロールをまとめて付ける管理者向けコマンド。
+    本番移行時に、すでにサーバーにいるが名前登録が済んでいない人を、
+    新規参加者と同じ「名前登録・お知らせだけ見える」状態にそろえるためのもの。
+    運営が締め出されないよう、「管理者」ロールや管理者権限を持つ人は対象外にする。
+    """
+    unverified = discord.utils.get(ctx.guild.roles, name=UNVERIFIED_ROLE_NAME)
+    member_role = discord.utils.get(ctx.guild.roles, name=MEMBER_ROLE_NAME)
+    if unverified is None or member_role is None:
+        await ctx.send(f"「{UNVERIFIED_ROLE_NAME}」または「{MEMBER_ROLE_NAME}」ロールが見つかりません。")
+        return
+
+    await ctx.send("会員ロールが無い人に未登録ロールを付けています…（少し時間がかかります）")
+
+    granted = skipped = failed = 0
+    for m in ctx.guild.members:
+        if m.bot or member_role in m.roles or unverified in m.roles:
+            continue
+        # 運営は締め出さないよう対象外
+        if m.guild_permissions.administrator or any(r.name == ADMIN_ROLE_NAME for r in m.roles):
+            skipped += 1
+            continue
+        try:
+            await m.add_roles(unverified, reason="既存メンバーの名前登録誘導のため")
+            granted += 1
+        except discord.HTTPException:
+            failed += 1
+
+    await ctx.send(f"✅ 付与{granted}人 / 運営のため対象外{skipped}人 / 失敗{failed}人")
 
 
 @bot.command(name="会員ロール設定")
@@ -997,6 +1036,25 @@ for _modal_cls in (NameModal, ProfileLocationModal, BusinessPairModal):
     _modal_cls.on_error = _modal_on_error
 for _view_cls in (ProfileBasicsView, BusinessEntryView, NameRegisterView):
     _view_cls.on_error = _view_on_error
+
+
+@bot.command(name="登録ボタン設置")
+@is_admin()
+async def post_register_button(ctx: commands.Context):
+    """
+    打ったチャンネルに「名前を登録する」ボタンを設置する管理者向けコマンド
+    （既存メンバーの名前登録誘導用。名前登録チャンネルで打つ想定）。
+    ボタンは永続化されているので、Botが再起動しても反応し続ける。
+    """
+    try:
+        await ctx.message.delete()  # コマンドのメッセージ自体は消す
+    except discord.HTTPException:
+        pass
+    await ctx.send(
+        "📝 本名の登録がまだの方は、下のボタンから登録してください。\n"
+        "登録が終わると「会員」ロールが付き、マッチング機能が使えるようになります。",
+        view=NameRegisterView(),
+    )
 
 
 @bot.event
