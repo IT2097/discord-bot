@@ -25,7 +25,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-03 登録誘導版"
+BOT_VERSION = "2026-10-03b 復元まとめ書き込み版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -589,15 +589,11 @@ async def restore_matches(ctx: commands.Context):
         await ctx.send("それらしいプライベートルームは見つかりませんでした。")
         return
 
-    added = 0
     try:
-        existing_pairs = await asyncio.to_thread(match_records.get_all_matched_pairs)
-        for pair in found_pairs:
-            if pair in existing_pairs:
-                continue
-            member_a, member_b = tuple(pair)
-            await asyncio.to_thread(match_records.append_match, member_a, member_b)
-            added += 1
+        # 1件ずつ書き込むとSheets APIの回数制限（429）に引っかかるため、まとめて1回で書き込む
+        added = await asyncio.to_thread(
+            match_records.append_matches, [tuple(pair) for pair in found_pairs]
+        )
     except Exception as error:  # noqa: BLE001 - 管理者にそのままエラー内容を見せる
         await ctx.send(f"エラーが発生しました：{error}")
         return
