@@ -11,6 +11,7 @@ from discord.ext import commands
 import match_views
 import match_store
 import match_records
+import member_archive
 import sheet_sync
 import sheets_client
 import web_app
@@ -25,7 +26,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-03b 復元まとめ書き込み版"
+BOT_VERSION = "2026-10-04 退会者移動版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -1118,6 +1119,76 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         )
 
     await run_id_sync(guild, send)
+
+
+async def run_member_archive(guild: discord.Guild, discord_id: str, display_name: str, reason: str):
+    """
+    退会者の行を「入力シート」から「退会者」シートへ移し、結果を id同期ログ に通知する。
+    on_member_remove（キック・自主退会）と、手動の「!退会処理」の両方から呼び出す。
+    """
+    channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
+
+    async def send(text: str):
+        if channel is not None:
+            await channel.send(text)
+        else:
+            print(text)
+
+    try:
+        result = await asyncio.to_thread(member_archive.archive_member, discord_id)
+    except Exception as error:  # noqa: BLE001 - 管理者にそのままエラー内容を見せる
+        await send(
+            f"⚠️ {display_name}（ID：{discord_id}）の退会処理に失敗しました：{error}\n"
+            "スプレッドシートを確認し、必要なら手動で移してください。"
+        )
+        return
+
+    if not result["found"]:
+        await send(
+            f"🚪 {display_name}（ID：{discord_id}）が{reason}。"
+            "入力シートにこのDiscordIDの行が無いため、シートは変更していません。"
+        )
+        return
+
+    await send(
+        f"🚪 {display_name}（ID：{discord_id}）が{reason}。\n"
+        f"「{result['name']}」の{result['moved']}行を、入力シートから退会者シートへ移しました。"
+    )
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    """
+    メンバーがサーバーからいなくなったら（キック・自主退会・BANのどれでも）、
+    入力シートの行を退会者シートへ移す。
+    """
+    if member.bot:
+        return
+    if os.getenv("GUILD_ID") and str(member.guild.id) != os.getenv("GUILD_ID"):
+        return  # 本番サーバー以外（テストサーバー等）では何もしない
+
+    await run_member_archive(member.guild, str(member.id), member.display_name, "サーバーから退出しました")
+
+
+@bot.command(name="退会処理")
+@is_admin()
+async def manual_archive(ctx: commands.Context, discord_id: str):
+    """
+    指定したDiscordIDの会員を、手動で退会者シートへ移す管理者向けコマンド
+    （botが止まっていた間に抜けた人の処理用）。
+    使い方: !退会処理 123456789012345678
+    """
+    discord_id = discord_id.strip()
+    if not discord_id.isdigit():
+        await ctx.send("DiscordID（数字）を指定してください。例：`!退会処理 123456789012345678`")
+        return
+
+    if ctx.guild.get_member(int(discord_id)) is not None:
+        await ctx.send("この人はまだサーバーに参加しています。退会処理はサーバーを抜けた人にだけ行えます。")
+        return
+
+    await ctx.send("退会処理をしています…")
+    await run_member_archive(ctx.guild, discord_id, f"ID {discord_id} の会員", "手動で退会処理されました")
 
 
 async def post_matching_room_link():
