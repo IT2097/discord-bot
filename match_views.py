@@ -180,193 +180,220 @@ async def create_match_channel(
     return channel
 
 
-class MatchApproveView(discord.ui.View):
-    """
-    「承認」チャンネルに投稿される「承認する / 断る」ボタン。
-    request_id を持たせておき、押されたタイミングで match_store から
-    申請内容（誰から誰への申請か）を引く。
 
-    チャンネルに投稿されるため、押せるのは申請の宛先本人のみに制限する。
-    """
+# ---------------------------------------------------------------------------
+# 承認チャンネルのボタン（承認する / 断る / プロフィール）
+#
+# ボタンの custom_id に申請ID を埋め込み（例：match_approve:1a2b...）、
+# DynamicItem として登録しておくことで、botが再起動・デプロイしても
+# 以前に投稿したボタンが押せるようにしている。
+# 申請の中身（誰から誰へ・いつ・状態）は match_store がスプレッドシートに保存している。
+# ---------------------------------------------------------------------------
 
-    def __init__(self, bot: discord.Client, request_id: str):
-        # 承認待ちのままチャンネルに残っていてもよいようタイムアウトなしにしている
-        super().__init__(timeout=None)
-        self.bot = bot
+_EXPIRED_TEXT = "この申請は有効期限（7日間）が切れています。申請者は、もう一度申請し直すことができます。"
+_DONE_TEXT = "この申請はすでに対応済みです。"
+
+
+async def _load_request_for_target(interaction: discord.Interaction, request_id: str) -> dict | None:
+    """申請を読み込み、押した人が宛先本人か・まだ承認待ちかを確認する。問題があれば本人に伝えて None を返す。"""
+    request = await asyncio.to_thread(match_store.get_request, request_id)
+
+    if request is None:
+        await interaction.response.send_message("この申請は見つかりませんでした。", ephemeral=True)
+        return None
+
+    if str(interaction.user.id) != request["target_id"]:
+        await interaction.response.send_message(
+            "この申請はあなた宛てではないため、操作できません。", ephemeral=True
+        )
+        return None
+
+    if request["status"] == match_store.STATUS_EXPIRED:
+        await interaction.response.send_message(_EXPIRED_TEXT, ephemeral=True)
+        await _close_request_message(interaction.message, "⌛ 有効期限が切れました")
+        return None
+
+    if request["status"] != match_store.STATUS_PENDING:
+        await interaction.response.send_message(_DONE_TEXT, ephemeral=True)
+        return None
+
+    return request
+
+
+async def _close_request_message(message: discord.Message | None, note: str):
+    """承認チャンネルのメッセージのボタンを押せなくし、結果を1行追記する。"""
+    if message is None:
+        return
+    content = message.content or ""
+    if note not in content:
+        content = f"{content}\n\n{note}"
+    try:
+        await message.edit(content=content, view=_build_request_view("closed", disabled=True))
+    except discord.HTTPException:
+        pass
+
+
+async def _handle_approve(interaction: discord.Interaction, request_id: str):
+    request = await _load_request_for_target(interaction, request_id)
+    if request is None:
+        return
+
+    await interaction.response.defer()
+    resolved = await asyncio.to_thread(match_store.resolve_request, request_id, match_store.STATUS_APPROVED)
+    if resolved is None:
+        await interaction.followup.send(_DONE_TEXT, ephemeral=True)  # 同時に2回押された場合
+        return
+    await _close_request_message(interaction.message, "✅ 承認されました")
+
+    guild = interaction.guild or (interaction.client.get_guild(int(GUILD_ID)) if GUILD_ID else None)
+    if guild is None:
+        await interaction.followup.send("サーバー情報が取得できませんでした。管理者に連絡してください。", ephemeral=True)
+        return
+
+    try:
+        requester = await guild.fetch_member(int(request["requester_id"]))
+        target = await guild.fetch_member(int(request["target_id"]))
+    except discord.NotFound:
+        await interaction.followup.send(
+            "相手がサーバーに見つかりませんでした。すでに退会された可能性があります。", ephemeral=True
+        )
+        return
+
+    try:
+        channel = await create_match_channel(guild, requester, target)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "Botに「チャンネルを管理」の権限がありません。管理者に連絡してください。", ephemeral=True
+        )
+        return
+    except discord.HTTPException as error:
+        await interaction.followup.send(f"チャンネル作成に失敗しました：{error}", ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        f"マッチングが成立しました！ {channel.mention} をご確認ください。", ephemeral=True
+    )
+
+    match_store.mark_matched(request["requester_id"], request["target_id"])
+    try:
+        # スプレッドシートへの書き込みはブロッキング処理なので別スレッドで実行する
+        await asyncio.to_thread(match_records.append_match, request["requester_id"], request["target_id"])
+    except Exception:  # noqa: BLE001 - 永続化に失敗してもマッチング自体は成立させる
+        print("マッチング履歴の永続化に失敗しました。")
+
+    try:
+        await requester.send(
+            f"{target.display_name} さんがマッチング申請を承認しました！ {channel.mention} をご確認ください。"
+        )
+    except discord.Forbidden:
+        pass  # DMを閉じているユーザーには通知できない
+
+
+async def _handle_reject(interaction: discord.Interaction, request_id: str):
+    request = await _load_request_for_target(interaction, request_id)
+    if request is None:
+        return
+
+    await interaction.response.defer()
+    resolved = await asyncio.to_thread(match_store.resolve_request, request_id, match_store.STATUS_REJECTED)
+    if resolved is None:
+        await interaction.followup.send(_DONE_TEXT, ephemeral=True)
+        return
+    await _close_request_message(interaction.message, "見送りになりました")
+    await interaction.followup.send("申請を断りました。", ephemeral=True)
+
+    guild = interaction.guild
+    if guild is None:
+        return
+    try:
+        requester = await guild.fetch_member(int(request["requester_id"]))
+        await requester.send("残念ながら、マッチング申請は今回見送られました。")
+    except (discord.NotFound, discord.Forbidden):
+        pass
+
+
+async def _handle_profile(interaction: discord.Interaction, request_id: str):
+    """
+    申請してきた相手のプロフィールを、押した本人にだけ見える形（ephemeral）で表示する。
+    内容はマッチング会員一覧（Webページ）に表示されているものと同じ情報一式。
+    """
+    request = await _load_request_for_target(interaction, request_id)
+    if request is None:
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        profile = await asyncio.to_thread(sheets_client.find_member, request["requester_id"])
+    except Exception as error:  # noqa: BLE001 - そのままエラー内容を見せる
+        await interaction.followup.send(f"プロフィールの取得に失敗しました：{error}", ephemeral=True)
+        return
+
+    if profile is None:
+        await interaction.followup.send("プロフィール情報が見つかりませんでした。", ephemeral=True)
+        return
+    await interaction.followup.send(_format_full_profile(profile), ephemeral=True)
+
+
+class ApproveButton(discord.ui.DynamicItem[discord.ui.Button], template=r"match_approve:(?P<rid>[0-9a-f]{32})"):
+    def __init__(self, request_id: str):
+        super().__init__(
+            discord.ui.Button(label="承認する", style=discord.ButtonStyle.success, custom_id=f"match_approve:{request_id}")
+        )
         self.request_id = request_id
 
-    async def _disable_all(self, interaction: discord.Interaction):
-        for item in self.children:
-            item.disabled = True
-        await interaction.message.edit(view=self)
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["rid"])
 
-    async def _check_is_target(self, interaction: discord.Interaction, request: dict) -> bool:
-        if str(interaction.user.id) != request["target_id"]:
-            await interaction.response.send_message(
-                "この申請はあなた宛てではないため、操作できません。", ephemeral=True
-            )
-            return False
-        return True
+    async def callback(self, interaction: discord.Interaction):
+        await _handle_approve(interaction, self.request_id)
 
-    @discord.ui.button(label="承認する", style=discord.ButtonStyle.success, custom_id="match_approve")
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        request = match_store.get_request(self.request_id)
 
-        if request is None:
-            await interaction.response.send_message(
-                "この申請はすでに期限切れ、またはキャンセルされています。",
-                ephemeral=True,
-            )
-            return
-
-        if not await self._check_is_target(interaction, request):
-            return
-
-        await interaction.response.defer()
-        match_store.resolve_request(self.request_id)
-        await self._disable_all(interaction)
-
-        if not GUILD_ID:
-            await interaction.followup.send(
-                "サーバー設定（GUILD_ID）が未設定のため、ルームを作成できませんでした。管理者に連絡してください。",
-                ephemeral=True,
-            )
-            return
-
-        guild = self.bot.get_guild(int(GUILD_ID))
-        if guild is None:
-            await interaction.followup.send(
-                "サーバー情報が取得できませんでした。管理者に連絡してください。",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            requester = await guild.fetch_member(int(request["requester_id"]))
-            target = await guild.fetch_member(int(request["target_id"]))
-        except discord.NotFound:
-            await interaction.followup.send(
-                "相手がサーバーに見つかりませんでした。すでに退会された可能性があります。",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            channel = await create_match_channel(guild, requester, target)
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "Botに「チャンネルを管理」の権限がありません。管理者に連絡してください。",
-                ephemeral=True,
-            )
-            return
-        except discord.HTTPException as error:
-            await interaction.followup.send(f"チャンネル作成に失敗しました：{error}", ephemeral=True)
-            return
-
-        await interaction.followup.send(
-            f"マッチングが成立しました！ {channel.mention} をご確認ください。",
-            ephemeral=True,
+class RejectButton(discord.ui.DynamicItem[discord.ui.Button], template=r"match_reject:(?P<rid>[0-9a-f]{32})"):
+    def __init__(self, request_id: str):
+        super().__init__(
+            discord.ui.Button(label="断る", style=discord.ButtonStyle.danger, custom_id=f"match_reject:{request_id}")
         )
+        self.request_id = request_id
 
-        match_store.mark_matched(request["requester_id"], request["target_id"])
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["rid"])
 
-        try:
-            # スプレッドシートへの書き込みはブロッキング処理なので別スレッドで実行する
-            await asyncio.to_thread(
-                match_records.append_match, request["requester_id"], request["target_id"]
-            )
-        except Exception:  # noqa: BLE001 - 永続化に失敗してもマッチング自体は成立させる
-            print("マッチング履歴の永続化に失敗しました。")
+    async def callback(self, interaction: discord.Interaction):
+        await _handle_reject(interaction, self.request_id)
 
-        try:
-            await requester.send(
-                f"{target.display_name} さんがマッチング申請を承認しました！ {channel.mention} をご確認ください。"
-            )
-        except discord.Forbidden:
-            pass  # DMを閉じているユーザーには通知できない
 
-    @discord.ui.button(label="断る", style=discord.ButtonStyle.danger, custom_id="match_reject")
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        request = match_store.get_request(self.request_id)
+class ProfileButton(discord.ui.DynamicItem[discord.ui.Button], template=r"match_profile:(?P<rid>[0-9a-f]{32})"):
+    def __init__(self, request_id: str):
+        super().__init__(
+            discord.ui.Button(label="プロフィール", style=discord.ButtonStyle.secondary, custom_id=f"match_profile:{request_id}")
+        )
+        self.request_id = request_id
 
-        if request is None:
-            await interaction.response.send_message(
-                "この申請はすでに期限切れ、またはキャンセルされています。",
-                ephemeral=True,
-            )
-            return
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["rid"])
 
-        if not await self._check_is_target(interaction, request):
-            return
+    async def callback(self, interaction: discord.Interaction):
+        await _handle_profile(interaction, self.request_id)
 
-        await interaction.response.defer()
-        match_store.resolve_request(self.request_id)
-        await self._disable_all(interaction)
 
-        await interaction.followup.send("申請を断りました。", ephemeral=True)
+# botの起動時に bot.add_dynamic_items(*REQUEST_BUTTONS) で登録する
+REQUEST_BUTTONS = (ApproveButton, RejectButton, ProfileButton)
 
-        if not GUILD_ID:
-            return
 
-        guild = self.bot.get_guild(int(GUILD_ID))
-        if guild is None:
-            return
-
-        try:
-            requester = await guild.fetch_member(int(request["requester_id"]))
-            await requester.send("残念ながら、マッチング申請は今回見送られました。")
-        except (discord.NotFound, discord.Forbidden):
-            pass
-
-    @discord.ui.button(label="プロフィール", style=discord.ButtonStyle.secondary, custom_id="match_view_profile")
-    async def view_profile(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """
-        申請してきた相手のプロフィールを、押した本人にだけ見える形（ephemeral）で表示する。
-        チャンネル上のメッセージ自体には表示しないことで、折りたたみのような見た目にしている。
-        内容はマッチング会員一覧（Webページ）に表示されているものと同じ情報一式。
-        """
-        request = match_store.get_request(self.request_id)
-
-        if request is None:
-            await interaction.response.send_message(
-                "この申請はすでに期限切れ、またはキャンセルされています。", ephemeral=True
-            )
-            return
-
-        if not await self._check_is_target(interaction, request):
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        if not GUILD_ID:
-            await interaction.followup.send(
-                "サーバー設定（GUILD_ID）が未設定のため、プロフィールを取得できませんでした。",
-                ephemeral=True,
-            )
-            return
-
-        guild = self.bot.get_guild(int(GUILD_ID))
-        if guild is None:
-            await interaction.followup.send("サーバー情報が取得できませんでした。", ephemeral=True)
-            return
-
-        try:
-            requester = await guild.fetch_member(int(request["requester_id"]))
-        except discord.NotFound:
-            await interaction.followup.send("申請者がサーバーに見つかりませんでした。", ephemeral=True)
-            return
-
-        try:
-            profile = sheets_client.find_member(str(requester.id))
-        except Exception as error:  # noqa: BLE001 - そのままエラー内容を見せる
-            await interaction.followup.send(f"プロフィールの取得に失敗しました：{error}", ephemeral=True)
-            return
-
-        if profile is None:
-            await interaction.followup.send("プロフィール情報が見つかりませんでした。", ephemeral=True)
-            return
-
-        await interaction.followup.send(_format_full_profile(profile), ephemeral=True)
+def _build_request_view(request_id: str, disabled: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    if disabled:
+        # 対応済み・期限切れのメッセージ用（押せない飾りのボタン）
+        for label, style in (("承認する", discord.ButtonStyle.success), ("断る", discord.ButtonStyle.danger), ("プロフィール", discord.ButtonStyle.secondary)):
+            view.add_item(discord.ui.Button(label=label, style=style, disabled=True))
+        return view
+    view.add_item(ApproveButton(request_id))
+    view.add_item(RejectButton(request_id))
+    view.add_item(ProfileButton(request_id))
+    return view
 
 
 async def send_match_request_to_channel(bot: discord.Client, requester_id: str, target_id: str, request_id: str):
@@ -388,12 +415,16 @@ async def send_match_request_to_channel(bot: discord.Client, requester_id: str, 
     requester = await guild.fetch_member(int(requester_id))
     target = await guild.fetch_member(int(target_id))
 
-    view = MatchApproveView(bot, request_id)
+    request = await asyncio.to_thread(match_store.get_request, request_id)
+    expires_text = ""
+    if request:
+        expires_text = f"\n（有効期限：<t:{int(request['expires_at'])}:f> まで）"
+
     try:
-        await channel.send(
+        message = await channel.send(
             f"{target.mention}\n{requester.display_name} さんからマッチの依頼が来ました！承認しますか？\n"
-            "（「プロフィール」ボタンから相手の情報を確認できます）",
-            view=view,
+            f"（「プロフィール」ボタンから相手の情報を確認できます）{expires_text}",
+            view=_build_request_view(request_id),
         )
     except discord.Forbidden as error:
         raise RuntimeError(
@@ -401,3 +432,85 @@ async def send_match_request_to_channel(bot: discord.Client, requester_id: str, 
             "管理者の方は !会員ロール設定 を再実行するか、チャンネルの権限でBotに"
             "「チャンネルを見る」「メッセージを送信」を許可してください。"
         ) from error
+
+    # リマインドと期限切れの表示のために、投稿したメッセージの場所を記録する
+    try:
+        await asyncio.to_thread(match_store.set_request_message, request_id, channel.id, message.id)
+    except Exception as error:  # noqa: BLE001 - 記録に失敗しても申請自体は届いている
+        print(f"申請メッセージの記録に失敗しました：{error}")
+
+
+# ---------------------------------------------------------------------------
+# リマインド・期限切れの定期処理（botから30分ごとに呼び出す）
+# ---------------------------------------------------------------------------
+
+async def _fetch_request_message(bot: discord.Client, request: dict) -> discord.Message | None:
+    if not request.get("channel_id") or not request.get("message_id"):
+        return None
+    try:
+        channel = bot.get_channel(int(request["channel_id"])) or await bot.fetch_channel(int(request["channel_id"]))
+        return await channel.fetch_message(int(request["message_id"]))
+    except (discord.HTTPException, ValueError):
+        return None
+
+
+async def process_pending_requests(bot: discord.Client):
+    """
+    3日たっても未対応の申請は、相手に1回だけリマインドする。
+    7日たった申請は「期限切れ」にしてボタンを押せなくし、申請者に再申請できることを伝える。
+    """
+    for request in await asyncio.to_thread(match_store.requests_to_expire):
+        message = await _fetch_request_message(bot, request)
+        await _close_request_message(message, "⌛ 有効期限が切れました")
+        await asyncio.to_thread(match_store.mark_expired, request["request_id"])
+
+        guild = bot.get_guild(int(GUILD_ID)) if GUILD_ID else None
+        if guild is None:
+            continue
+        try:
+            requester = await guild.fetch_member(int(request["requester_id"]))
+            target = guild.get_member(int(request["target_id"]))
+            target_name = target.display_name if target else "相手"
+            await requester.send(
+                f"{target_name} さんへのマッチング申請は、7日間返事がなかったため期限切れになりました。"
+                "会員一覧ページから、もう一度申請できます。"
+            )
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+    for request in await asyncio.to_thread(match_store.requests_to_remind):
+        message = await _fetch_request_message(bot, request)
+        if message is not None:
+            try:
+                await message.reply(
+                    f"<@{request['target_id']}> 未対応のマッチング申請があります。"
+                    f"<t:{int(request['expires_at'])}:R> に期限が切れるので、承認するか断るかを選んでください。",
+                    mention_author=False,
+                )
+            except discord.HTTPException:
+                pass
+        await asyncio.to_thread(match_store.mark_reminded, request["request_id"])
+
+
+class LegacyRequestButton(discord.ui.DynamicItem[discord.ui.Button], template=r"(?P<kind>match_approve|match_reject|match_view_profile)"):
+    """
+    今回の改修より前に投稿された申請のボタン用。
+    古い申請は再起動で中身が消えているため、押されたらボタンを閉じて再申請をお願いする。
+    """
+
+    def __init__(self, kind: str):
+        super().__init__(discord.ui.Button(label="（旧）", custom_id=kind))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["kind"])
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "この申請は古い形式のため、受け付けを終了しました。申請者の方に、会員一覧ページからもう一度申請してもらってください。",
+            ephemeral=True,
+        )
+        await _close_request_message(interaction.message, "⌛ 受付終了（再申請をお願いします）")
+
+
+REQUEST_BUTTONS = (ApproveButton, RejectButton, ProfileButton, LegacyRequestButton)

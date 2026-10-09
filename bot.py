@@ -6,7 +6,7 @@ import io
 import threading
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import match_views
 import match_store
@@ -26,7 +26,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-04 退会者移動版"
+BOT_VERSION = "2026-10-09 申請7日・リマインド版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -1191,6 +1191,18 @@ async def manual_archive(ctx: commands.Context, discord_id: str):
     await run_member_archive(ctx.guild, discord_id, f"ID {discord_id} の会員", "手動で退会処理されました")
 
 
+@tasks.loop(minutes=30)
+async def check_match_requests():
+    """
+    30分ごとに、マッチング申請のリマインドと期限切れの処理を行う。
+    3日たっても未対応なら相手に1回リマインドし、7日たったら期限切れにして申請者に再申請を案内する。
+    """
+    try:
+        await match_views.process_pending_requests(bot)
+    except Exception as error:  # noqa: BLE001 - 定期処理が止まらないようにログだけ残す
+        print(f"申請のリマインド・期限切れ処理でエラー：{error}")
+
+
 async def post_matching_room_link():
     """
     「マッチングルーム」チャンネルに、会員情報確認・マッチング申請ページの
@@ -1228,7 +1240,17 @@ async def on_ready():
     # Railway再起動後も既存ボタンを反応させる
     bot.add_view(MatchView())
     bot.add_view(NameRegisterView())
+    # 承認チャンネルの申請ボタン（承認する・断る・プロフィール）を、再起動後も反応させる
+    bot.add_dynamic_items(*match_views.REQUEST_BUTTONS)
     print(f"ログインしました: {bot.user}")
+
+    # 承認待ちの申請をスプレッドシートから読み込み、リマインド・期限切れの定期処理を始める
+    try:
+        await asyncio.to_thread(match_store.preload)
+    except Exception as error:  # noqa: BLE001 - 読み込みに失敗しても、最初の操作時に読み直す
+        print(f"マッチング申請の読み込みに失敗しました：{error}")
+    if not check_match_requests.is_running():
+        check_match_requests.start()
 
     await post_matching_room_link()
 
