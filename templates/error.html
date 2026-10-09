@@ -5,6 +5,18 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>エラー | マッチング会員一覧</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <style>
+    .error-account { display: flex; align-items: center; gap: 12px; margin: 20px auto 0; padding: 12px 16px; max-width: 360px; border-radius: 14px; background: rgba(255, 255, 255, 0.08); text-align: left; }
+    .error-account img, .error-account .avatar { width: 48px; height: 48px; border-radius: 50%; flex-shrink: 0; }
+    .error-account .avatar { display: flex; align-items: center; justify-content: center; background: rgba(255, 255, 255, 0.16); font-weight: 700; font-size: 18px; }
+    .error-account .label { font-size: 12px; opacity: 0.75; margin: 0; }
+    .error-account .name { font-size: 16px; font-weight: 700; margin: 2px 0 0; }
+    .error-account .meta { font-size: 12px; opacity: 0.75; margin: 2px 0 0; word-break: break-all; }
+    .error-hints { margin: 20px auto 0; padding: 0 0 0 1.2em; max-width: 360px; text-align: left; font-size: 14px; line-height: 1.8; opacity: 0.85; }
+    .error-actions { display: flex; flex-direction: column; gap: 10px; margin: 24px auto 0; max-width: 360px; }
+    .error-actions a { display: block; padding: 14px 16px; border-radius: 12px; text-align: center; font-weight: 700; text-decoration: none; color: inherit; border: 1px solid rgba(255, 255, 255, 0.35); }
+    .error-actions a.primary { background: #ffffff; color: #1a1a2e; border-color: #ffffff; }
+  </style>
 </head>
 <body>
   <div class="error-wrap">
@@ -12,6 +24,35 @@
       <p class="eyebrow">Error</p>
       <h1>うまくいきませんでした</h1>
       <p>{{ message }}</p>
+
+      {% if account %}
+      <div class="error-account">
+        {% if account.avatar_url %}
+          <img src="{{ account.avatar_url }}" alt="">
+        {% else %}
+          <div class="avatar" aria-hidden="true">{{ account.name[:1] }}</div>
+        {% endif %}
+        <div>
+          <p class="label">今ログインしているアカウント</p>
+          <p class="name">{{ account.name }}</p>
+          <p class="meta">@{{ account.username }} ・ ID：{{ account.id }}</p>
+        </div>
+      </div>
+      {% endif %}
+
+      {% if hints %}
+      <ul class="error-hints">
+        {% for hint in hints %}<li>{{ hint }}</li>{% endfor %}
+      </ul>
+      {% endif %}
+
+      {% if actions %}
+      <div class="error-actions">
+        {% for action in actions %}
+          <a href="{{ action.href }}" class="{{ 'primary' if action.primary else '' }}">{{ action.label }}</a>
+        {% endfor %}
+      </div>
+      {% endif %}
     </div>
   </div>
 </body>
