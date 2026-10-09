@@ -233,6 +233,31 @@ async def _close_request_message(message: discord.Message | None, note: str):
         pass
 
 
+async def _delete_request_message(message: discord.Message | None):
+    """
+    承認チャンネルの申請メッセージを削除する。
+    その申請に返信する形で送ったリマインドのメッセージも、あわせて削除する。
+    削除できなかった場合は、ボタンを押せなくして「承認されました」と追記する。
+    """
+    if message is None:
+        return
+
+    try:
+        async for later in message.channel.history(limit=200, after=message):
+            if later.author.id == message.author.id and later.reference and later.reference.message_id == message.id:
+                try:
+                    await later.delete()
+                except discord.HTTPException:
+                    pass
+    except discord.HTTPException:
+        pass
+
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        await _close_request_message(message, "✅ 承認されました")
+
+
 async def _handle_approve(interaction: discord.Interaction, request_id: str):
     request = await _load_request_for_target(interaction, request_id)
     if request is None:
@@ -243,7 +268,8 @@ async def _handle_approve(interaction: discord.Interaction, request_id: str):
     if resolved is None:
         await interaction.followup.send(_DONE_TEXT, ephemeral=True)  # 同時に2回押された場合
         return
-    await _close_request_message(interaction.message, "✅ 承認されました")
+    # 承認されたら、承認チャンネルの申請メッセージ（とリマインドの返信）は不要なので削除する
+    await _delete_request_message(interaction.message)
 
     guild = interaction.guild or (interaction.client.get_guild(int(GUILD_ID)) if GUILD_ID else None)
     if guild is None:
