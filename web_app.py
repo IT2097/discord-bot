@@ -96,13 +96,17 @@ def create_app(bot, run_coro):
         state = secrets.token_urlsafe(16)
         session["oauth_state"] = state
 
+        # 「別のアカウントでログインし直す」から来た場合は、Discordの確認画面を必ず表示する
+        # （確認画面に今のアカウントが表示され、「あなたではありませんか？」から切り替えられる）
+        switch_account = request.args.get("switch") == "1"
+
         params = {
             "client_id": CLIENT_ID,
             "redirect_uri": REDIRECT_URI,
             "response_type": "code",
             "scope": "identify",
             "state": state,
-            "prompt": "none",
+            "prompt": "consent" if switch_account else "none",
         }
         query = "&".join(f"{k}={requests.utils.quote(str(v))}" for k, v in params.items())
         return redirect(f"{DISCORD_API_BASE}/oauth2/authorize?{query}")
@@ -152,14 +156,44 @@ def create_app(bot, run_coro):
 
         # 対象サーバーのメンバーかどうかをBot経由で確認する
         try:
-            is_member = run_coro(_is_guild_member(bot, discord_id))
-        except Exception:
-            is_member = False
+            membership = run_coro(_check_guild_membership(bot, discord_id))
+        except Exception:  # noqa: BLE001 - botの起動中・応答なしなど
+            membership = "unavailable"
 
-        if not is_member:
+        if membership == "unavailable":
             return render_template(
                 "error.html",
-                message="対象サーバーのメンバーとして確認できませんでした。サーバーに参加してから再度お試しください。",
+                message="ただいまシステムの準備中です。1〜2分ほど待ってから、もう一度お試しください。",
+                actions=[{"label": "もう一度ログインする", "href": url_for("login"), "primary": True}],
+            )
+
+        if membership == "not_member":
+            # 運営がRailwayのログで確認できるように記録しておく
+            print(f"[ログイン拒否] サーバーにいないアカウント：{discord_name}（ID：{discord_id}）")
+
+            avatar_hash = user_json.get("avatar")
+            avatar_url = (
+                f"https://cdn.discordapp.com/avatars/{discord_id}/{avatar_hash}.png?size=96"
+                if avatar_hash
+                else None
+            )
+            return render_template(
+                "error.html",
+                message="このDiscordアカウントは、リジェのサーバーに参加していません。",
+                account={
+                    "name": discord_name,
+                    "username": user_json.get("username", ""),
+                    "id": discord_id,
+                    "avatar_url": avatar_url,
+                },
+                hints=[
+                    "Discordのアプリと、このブラウザでは、ログインしているアカウントが別々です。",
+                    "上のアカウントが、いつもアプリで使っているアカウントと違う場合は、下のボタンから切り替えてください。",
+                    "切り替えの画面で「あなたではありませんか？」を押すと、別のアカウントでログインできます。",
+                ],
+                actions=[
+                    {"label": "別のアカウントでログインし直す", "href": url_for("login", switch=1), "primary": True},
+                ],
             )
 
         session["discord_id"] = discord_id
@@ -196,15 +230,27 @@ def create_app(bot, run_coro):
     return app
 
 
-async def _is_guild_member(bot, discord_id: str) -> bool:
+async def _check_guild_membership(bot, discord_id: str) -> str:
+    """
+    対象サーバーのメンバーかどうかを確認する。
+      "member"      … サーバーにいる
+      "not_member"  … サーバーにいない（別アカウントでログインしている可能性が高い）
+      "unavailable" … botの起動直後などで確認できなかった（時間をおけば通る）
+    """
+    import discord
+
     guild = bot.get_guild(int(GUILD_ID))
     if guild is None:
-        return False
+        return "unavailable"
+    if guild.get_member(int(discord_id)) is not None:
+        return "member"
     try:
         await guild.fetch_member(int(discord_id))
-        return True
-    except Exception:
-        return False
+        return "member"
+    except discord.NotFound:
+        return "not_member"
+    except Exception:  # noqa: BLE001 - 通信エラーなど
+        return "unavailable"
 
 
 async def _notify_match_request(bot, requester_id: str, target_id: str, request_id: str):
