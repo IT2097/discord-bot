@@ -4,6 +4,7 @@ import os
 import asyncio
 import io
 import threading
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord.ext import commands, tasks
@@ -26,7 +27,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-09 申請7日・リマインド版"
+BOT_VERSION = "2026-10-12b コミュニティお知らせ版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -1201,6 +1202,110 @@ async def check_match_requests():
         await match_views.process_pending_requests(bot)
     except Exception as error:  # noqa: BLE001 - 定期処理が止まらないようにログだけ残す
         print(f"申請のリマインド・期限切れ処理でエラー：{error}")
+
+
+# ---------------------------------------------------------------------------
+# 新しいコミュニティ（フォーラムチャンネル）のお知らせ
+#
+# 「コミュニティ」カテゴリに新しいフォーラムチャンネルが作られ、
+#   ・チャンネルの権限に「主」となるメンバーが追加されている
+#   ・投稿ガイドライン（概要）が入力されている
+# の2つがそろった時点で、同じカテゴリの「お知らせ」チャンネルに自動で告知する。
+# 作成 → 主の追加 → 概要の入力 の順番は問わない（どれかが変わるたびに確認する）。
+# ---------------------------------------------------------------------------
+
+COMMUNITY_CATEGORY_NAME = os.getenv("COMMUNITY_CATEGORY_NAME", "コミュニティ")
+COMMUNITY_NOTICE_CHANNEL_NAME = os.getenv("COMMUNITY_NOTICE_CHANNEL_NAME", "お知らせ")
+
+_announced_community_ids: set[int] = set()
+_community_announce_lock = asyncio.Lock()
+
+
+def _is_community_forum(channel) -> bool:
+    return (
+        isinstance(channel, discord.ForumChannel)
+        and channel.category is not None
+        and channel.category.name == COMMUNITY_CATEGORY_NAME
+    )
+
+
+async def _community_owners(channel: discord.ForumChannel) -> list[discord.Member]:
+    """チャンネルの権限に個別に追加されているメンバー（bot以外）＝コミュニティの主。"""
+    owners = []
+    for target, _overwrite in channel.overwrites.items():
+        if isinstance(target, discord.Role) or getattr(target, "type", None) is discord.Role:
+            continue
+        member = target if isinstance(target, discord.Member) else channel.guild.get_member(target.id)
+        if member is None:
+            try:
+                member = await channel.guild.fetch_member(target.id)
+            except discord.HTTPException:
+                continue
+        if not member.bot:
+            owners.append(member)
+    return owners
+
+
+async def _already_announced(notice_channel: discord.TextChannel, community: discord.ForumChannel) -> bool:
+    """お知らせチャンネルに、このコミュニティの告知がすでにあるか（再起動しても二重に出さないため）。"""
+    if community.id in _announced_community_ids:
+        return True
+    async for message in notice_channel.history(limit=200):
+        if message.author.id == bot.user.id and community.mention in message.content:
+            _announced_community_ids.add(community.id)
+            return True
+    return False
+
+
+async def try_announce_community(channel):
+    """条件がそろっていれば、新しいコミュニティを「お知らせ」チャンネルに告知する。"""
+    if not _is_community_forum(channel):
+        return
+    topic = (channel.topic or "").strip()
+    if not topic:
+        return  # 概要（投稿ガイドライン）がまだ入力されていない
+    if len(topic) > 1500:
+        topic = topic[:1500] + "…"  # Discordの1メッセージ2000文字の上限に収める
+
+    owners = await _community_owners(channel)
+    if not owners:
+        return  # 主がまだ追加されていない
+
+    notice_channel = discord.utils.get(channel.category.text_channels, name=COMMUNITY_NOTICE_CHANNEL_NAME)
+    if notice_channel is None:
+        print(f"「{COMMUNITY_CATEGORY_NAME}」カテゴリに「{COMMUNITY_NOTICE_CHANNEL_NAME}」チャンネルが見つかりません。")
+        return
+
+    async with _community_announce_lock:
+        if await _already_announced(notice_channel, channel):
+            return
+        owner_text = "・".join(owner.mention for owner in owners)
+        await notice_channel.send(
+            f"🎉 {owner_text}さんが新しいコミュニティを作成しました！\n"
+            f"「{channel.mention}」\n\n"
+            f"**概要**\n{topic}",
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        _announced_community_ids.add(channel.id)
+
+
+@bot.event
+async def on_guild_channel_create(channel):
+    await try_announce_community(channel)
+
+
+@bot.event
+async def on_guild_channel_update(before, after):
+    """
+    概要（投稿ガイドライン）の保存・主の追加・コミュニティカテゴリへの移動があったときだけ確認する。
+    以前からあるコミュニティ（シーシャ・在宅ワークなど）も、概要を保存し直したタイミングで告知される。
+    それ以外の変更（名前の変更や並べ替えなど）では告知しない。
+    """
+    topic_changed = getattr(before, "topic", None) != getattr(after, "topic", None)
+    overwrites_changed = before.overwrites != after.overwrites
+    moved_into_category = getattr(before, "category_id", None) != getattr(after, "category_id", None)
+    if topic_changed or overwrites_changed or moved_into_category:
+        await try_announce_community(after)
 
 
 async def post_matching_room_link():
