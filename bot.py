@@ -27,7 +27,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-12b コミュニティお知らせ版"
+BOT_VERSION = "2026-10-15 名前1欄版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -640,14 +640,20 @@ async def organize_match_rooms(ctx: commands.Context):
     await ctx.send(message)
 
 
-class NameModal(discord.ui.Modal, title="本名を登録"):
+class NameModal(discord.ui.Modal, title="名前を登録"):
     """
     「名前を登録する」ボタンを押すと開くフォーム。姓・名を入力してもらい、
     サーバー上のニックネームに反映させたうえでid同期を実行する。
     """
 
-    last_name = discord.ui.TextInput(label="姓", placeholder="例：山田", max_length=20)
-    first_name = discord.ui.TextInput(label="名", placeholder="例：太郎", max_length=20)
+    # 本名・ニックネームのどちらでも登録できるよう、1つの入力欄にまとめている
+    # （Discordのサーバーニックネームは最大32文字のため、それに合わせる）
+    display_name = discord.ui.TextInput(
+        label="名前（本名またはニックネーム）",
+        placeholder="例：山田太郎、やまちゃん",
+        min_length=1,
+        max_length=32,
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -678,7 +684,10 @@ class NameModal(discord.ui.Modal, title="本名を登録"):
             return
 
         # ニックネームの表記は姓名の間に空白を入れない
-        full_name = f"{self.last_name.value.strip()}{self.first_name.value.strip()}"
+        full_name = " ".join(self.display_name.value.split())  # 前後と連続した空白を整える
+        if not full_name:
+            await interaction.followup.send("名前を入力してください。", ephemeral=True)
+            return
 
         try:
             await member.edit(nick=full_name)
@@ -1049,7 +1058,7 @@ async def post_register_button(ctx: commands.Context):
     except discord.HTTPException:
         pass
     await ctx.send(
-        "📝 本名の登録がまだの方は、下のボタンから登録してください。\n"
+        "📝 名前の登録がまだの方は、下のボタンから登録してください（本名・ニックネームどちらでもOKです）。\n"
         "登録が終わると「会員」ロールが付き、マッチング機能が使えるようになります。",
         view=NameRegisterView(),
     )
@@ -1088,7 +1097,7 @@ async def on_member_join(member: discord.Member):
 
         await register_channel.send(
             f"🎉 {member.mention} さん、ようこそ！\n"
-            "会員情報と連携するために、まずは本名を登録してください。",
+            "会員情報と連携するために、まずは名前を登録してください（本名・ニックネームどちらでもOKです）。",
             view=NameRegisterView(),
         )
     else:
