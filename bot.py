@@ -27,7 +27,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-15 名前1欄版"
+BOT_VERSION = "2026-10-16 チャンネル数コマンド版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -638,6 +638,39 @@ async def organize_match_rooms(ctx: commands.Context):
     if failed:
         message += f"\n⚠️ {failed}件は移動に失敗しました（Botの「チャンネルの管理」権限を確認してください）。"
     await ctx.send(message)
+
+
+@bot.command(name="チャンネル数")
+@is_admin()
+async def count_channels(ctx: commands.Context):
+    """
+    マッチングルーム一覧（カテゴリごと）のチャンネル数と、サーバー全体のチャンネル数を表示する管理者向けコマンド。
+    Discordは「1カテゴリ50チャンネルまで」「1サーバー500チャンネルまで（カテゴリも含む）」が上限。
+    """
+    guild = ctx.guild
+    categories = sorted(
+        (c for c in guild.categories if match_views._is_match_category(c)), key=lambda c: c.position
+    )
+
+    lines = ["📊 チャンネル数"]
+    room_total = 0
+    if categories:
+        for category in categories:
+            count = len(category.channels)
+            room_total += count
+            lines.append(f"・{category.name}：{count} / 50")
+    else:
+        lines.append(f"・「{match_views.MATCH_CATEGORY_NAME}」カテゴリはまだありません")
+    lines.append(f"→ マッチングルーム合計：{room_total}件")
+
+    server_total = len(guild.channels)  # テキスト・ボイス・フォーラム・カテゴリを含む（スレッドは含まない）
+    remaining = 500 - server_total
+    lines.append("")
+    lines.append(f"サーバー全体：{server_total} / 500（あと{remaining}個作れます）")
+    if remaining <= 50:
+        lines.append("⚠️ 上限が近づいています。不要なマッチングルームの整理を検討してください。")
+
+    await ctx.send("\n".join(lines))
 
 
 class NameModal(discord.ui.Modal, title="名前を登録"):
