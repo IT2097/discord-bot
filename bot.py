@@ -27,7 +27,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-16 チャンネル数コマンド版"
+BOT_VERSION = "2026-10-16b マッチングルームDM通知版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -1348,6 +1348,69 @@ async def on_guild_channel_update(before, after):
     moved_into_category = getattr(before, "category_id", None) != getattr(after, "category_id", None)
     if topic_changed or overwrites_changed or moved_into_category:
         await try_announce_community(after)
+
+
+# ---------------------------------------------------------------------------
+# マッチングルームの新着メッセージをDMで知らせる
+#
+# マッチングルーム（2人だけが見えるチャンネル）で片方が発言したら、もう片方にbotからDMを送る。
+# ルームの中には何も投稿しないので、会話の邪魔にならない。
+# 通知が多くなりすぎないよう、同じルームの同じ相手へは ROOM_DM_INTERVAL_MINUTES 分に1回だけ送る。
+# 相手がそのルームで直近 ROOM_ACTIVE_MINUTES 分以内に発言していれば（会話中なので）送らない。
+# ---------------------------------------------------------------------------
+
+ROOM_DM_INTERVAL_MINUTES = int(os.getenv("ROOM_DM_INTERVAL_MINUTES", "30"))
+ROOM_ACTIVE_MINUTES = int(os.getenv("ROOM_ACTIVE_MINUTES", "5"))
+
+_room_last_dm: dict[tuple[int, int], datetime] = {}  # (チャンネルID, 受け取る人のID) -> 最後にDMした時刻
+_room_last_post: dict[tuple[int, int], datetime] = {}  # (チャンネルID, 発言した人のID) -> 最後に発言した時刻
+
+
+@bot.listen("on_message")
+async def notify_match_room_message(message: discord.Message):
+    """マッチングルームで発言があったら、相手にDMで知らせる（bot.listen なのでコマンド処理には影響しない）。"""
+    if message.author.bot or message.guild is None:
+        return
+    channel = message.channel
+    if not isinstance(channel, discord.TextChannel) or channel.category is None:
+        return
+    if not match_views._is_match_category(channel.category):
+        return
+
+    member_ids = match_views.is_private_match_room(channel)
+    if not member_ids or str(message.author.id) not in member_ids:
+        return  # マッチングルームではない、または運営など2人以外の発言
+
+    now = datetime.now(timezone.utc)
+    _room_last_post[(channel.id, message.author.id)] = now
+
+    other_id = int(next(uid for uid in member_ids if uid != str(message.author.id)))
+    key = (channel.id, other_id)
+
+    # 相手もさっきまでこのルームで話していた（会話中）なら送らない
+    other_last_post = _room_last_post.get(key)
+    if other_last_post and now - other_last_post < timedelta(minutes=ROOM_ACTIVE_MINUTES):
+        return
+
+    # 前回のDMから間がなければ送らない（連続で送られて通知だらけになるのを防ぐ）
+    last_dm = _room_last_dm.get(key)
+    if last_dm and now - last_dm < timedelta(minutes=ROOM_DM_INTERVAL_MINUTES):
+        return
+
+    other = message.guild.get_member(other_id)
+    if other is None:
+        return  # 相手が退会済み
+
+    _room_last_dm[key] = now
+    try:
+        await other.send(
+            f"💬 {message.author.display_name} さんから、マッチングルームにメッセージが届きました。\n"
+            f"{message.jump_url}\n"
+            f"（{ROOM_DM_INTERVAL_MINUTES}分以内に続けて届いたメッセージは、まとめて1回だけお知らせします）"
+        )
+    except discord.HTTPException:
+        # DMを受け取らない設定の人には送れない
+        print(f"マッチングルームのDM通知を送れませんでした：{other}（{other.id}）")
 
 
 async def post_matching_room_link():
