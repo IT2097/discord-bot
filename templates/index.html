@@ -5,6 +5,21 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>マッチング会員一覧</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <style>
+    /* 事業内容は一定の高さで折りたたみ、「続きを読む」で開く */
+    .details-body { position: relative; display: flex; flex-direction: column; gap: 8px; max-height: 92px; overflow: hidden; }
+    .details.expanded .details-body { max-height: none; }
+    .details.clamped:not(.expanded) .details-body::after {
+      content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 32px;
+      background: linear-gradient(to bottom, transparent, var(--surface)); pointer-events: none;
+    }
+    .more-btn {
+      align-self: flex-start; padding: 0; border: none; background: none;
+      color: var(--accent); font-size: 12px; font-weight: 700; cursor: pointer;
+    }
+    .more-btn:hover { text-decoration: underline; }
+    .card .request-btn { margin-top: auto; }
+  </style>
 </head>
 <body>
   <div class="page">
@@ -61,9 +76,6 @@
               <div class="meta">{{ [member.age, member.gender, (member.prefecture ~ member.city)] | select | join(' ・ ') }}</div>
             </div>
           </div>
-          {% if member.businesses %}
-          <button class="expand-btn" type="button" aria-label="業種・事業内容を表示">+</button>
-          {% endif %}
         </div>
 
         <div class="status">
@@ -77,13 +89,16 @@
         </div>
 
         {% if member.businesses %}
-        <div class="details" hidden>
-          {% for biz in member.businesses %}
-          <div class="business">
-            {% if biz.type %}<span class="business-type">{{ biz.type }}</span>{% endif %}
-            {% if biz.content %}<span class="business-content">{{ biz.content }}</span>{% endif %}
+        <div class="details">
+          <div class="details-body">
+            {% for biz in member.businesses %}
+            <div class="business">
+              {% if biz.type %}<span class="business-type">{{ biz.type }}</span>{% endif %}
+              {% if biz.content %}<span class="business-content">{{ biz.content }}</span>{% endif %}
+            </div>
+            {% endfor %}
           </div>
-          {% endfor %}
+          <button class="more-btn" type="button" hidden aria-expanded="false">続きを読む</button>
         </div>
         {% endif %}
 
@@ -151,22 +166,33 @@
       if (el) el.addEventListener('input', applyFilters);
     });
 
-    document.querySelectorAll('.expand-btn').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const details = btn.closest('.card').querySelector('.details');
-        if (!details) return;
-
-        const isHidden = details.hasAttribute('hidden');
-        if (isHidden) {
-          details.removeAttribute('hidden');
-          btn.textContent = '−';
-          btn.classList.add('open');
-        } else {
-          details.setAttribute('hidden', '');
-          btn.textContent = '+';
-          btn.classList.remove('open');
-        }
+    // 事業内容が長いカードにだけ「続きを読む」を出す
+    function updateClamps() {
+      document.querySelectorAll('.details').forEach((details) => {
+        if (details.classList.contains('expanded')) return;
+        const body = details.querySelector('.details-body');
+        const btn = details.querySelector('.more-btn');
+        if (!body || !btn || body.offsetParent === null) return;
+        const overflowing = body.scrollHeight > body.clientHeight + 1;
+        details.classList.toggle('clamped', overflowing);
+        btn.hidden = !overflowing;
       });
+    }
+
+    document.querySelectorAll('.more-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const details = btn.closest('.details');
+        const expanded = details.classList.toggle('expanded');
+        btn.textContent = expanded ? '閉じる' : '続きを読む';
+        btn.setAttribute('aria-expanded', String(expanded));
+        if (!expanded) updateClamps();
+      });
+    });
+
+    updateClamps();
+    window.addEventListener('resize', updateClamps);
+    [keywordInput, ageSelect, genderSelect, prefectureSelect].forEach((el) => {
+      if (el) el.addEventListener('input', updateClamps);
     });
 
     document.querySelectorAll('.request-btn[data-target]').forEach((btn) => {
