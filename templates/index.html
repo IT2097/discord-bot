@@ -51,7 +51,11 @@
            data-prefecture="{{ member.prefecture }}">
         <div class="card-top">
           <div class="identity">
+            {% if member.avatar_url %}
+            <img class="avatar" src="{{ member.avatar_url }}" alt="" loading="lazy" style="object-fit: cover; padding: 0;">
+            {% else %}
             <div class="avatar">{{ member.name[0] }}</div>
+            {% endif %}
             <div class="name-block">
               <div class="name">{{ member.name }}</div>
               <div class="meta">{{ [member.age, member.gender, (member.prefecture ~ member.city)] | select | join(' ・ ') }}</div>
@@ -79,14 +83,6 @@
             {% if biz.type %}<span class="business-type">{{ biz.type }}</span>{% endif %}
             {% if biz.content %}<span class="business-content">{{ biz.content }}</span>{% endif %}
           </div>
-          {% endfor %}
-        </div>
-        {% endif %}
-
-        {% if member.urls %}
-        <div class="urls">
-          {% for url in member.urls %}
-            <a class="url-link" href="{{ url }}" target="_blank" rel="noopener noreferrer">🔗 リンク{{ loop.index }}</a>
           {% endfor %}
         </div>
         {% endif %}
