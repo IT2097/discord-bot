@@ -24,6 +24,28 @@ REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")  # 例: https://xxxx.up.railway
 GUILD_ID = os.getenv("GUILD_ID")
 
 
+# 都道府県の並び順（全国地方公共団体コード順＝北海道から沖縄まで）
+PREFECTURE_ORDER = [
+    "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+    "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+    "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県", "静岡県", "愛知県",
+    "三重県", "滋賀県", "京都府", "大阪府", "兵庫県", "奈良県", "和歌山県",
+    "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+    "徳島県", "香川県", "愛媛県", "高知県",
+    "福岡県", "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
+]
+
+
+def _prefecture_sort_key(name: str):
+    """「北海道」「東京」「東京都」のように「都・府・県」の有無がばらばらでも、正しい順番に並べる。"""
+    text = name.strip()
+    for index, prefecture in enumerate(PREFECTURE_ORDER):
+        short = prefecture if prefecture == "北海道" else prefecture[:-1]
+        if text in (prefecture, short):
+            return (0, index, text)
+    return (1, 0, text)  # 都道府県名として読めないものは最後
+
+
 def create_app(bot, run_coro):
     """
     bot: discord.ext.commands.Bot のインスタンス（承認チャンネルへの投稿などに使う）
@@ -76,9 +98,21 @@ def create_app(bot, run_coro):
             )
             member["search_blob"] = f"{member['name']} {business_text}".strip().lower()
 
+        # Discordで設定しているアイコン画像のURLを付ける（未設定・サーバーにいない人は名前の1文字目を表示）
+        try:
+            avatar_urls = run_coro(_avatar_urls(bot, [m["discord_id"] for m in other_members]))
+        except Exception:  # noqa: BLE001 - アイコンが取れなくても一覧自体は表示する
+            avatar_urls = {}
+        for member in other_members:
+            member["avatar_url"] = avatar_urls.get(member["discord_id"])
+
         ages = sorted({m["age"] for m in other_members if m.get("age")})
         genders = sorted({m["gender"] for m in other_members if m.get("gender")})
-        prefectures = sorted({m["prefecture"] for m in other_members if m.get("prefecture")})
+        # 都道府県は北から順（北海道→沖縄）に並べる。一覧にない書き方（「札幌」など）は最後に回す
+        prefectures = sorted(
+            {m["prefecture"] for m in other_members if m.get("prefecture")},
+            key=_prefecture_sort_key,
+        )
 
         return render_template(
             "index.html",
@@ -228,6 +262,27 @@ def create_app(bot, run_coro):
         return {"ok": True, "message": "マッチング申請を送信しました！"}
 
     return app
+
+
+async def _avatar_urls(bot, discord_ids: list[str]) -> dict[str, str]:
+    """
+    会員のDiscordアイコン画像のURLを返す（botが持っているサーバーのメンバー情報から取るので、通信は発生しない）。
+    サーバー用のアイコンがあればそれを、なければ普段のアイコンを使う。
+    アイコンを設定していない人と、サーバーにいない人は含めない。
+    """
+    guild = bot.get_guild(int(GUILD_ID))
+    if guild is None:
+        return {}
+    urls: dict[str, str] = {}
+    for discord_id in discord_ids:
+        try:
+            member = guild.get_member(int(discord_id))
+        except (TypeError, ValueError):
+            continue
+        if member is None or (member.guild_avatar is None and member.avatar is None):
+            continue
+        urls[str(discord_id)] = member.display_avatar.replace(size=128, static_format="png").url
+    return urls
 
 
 async def _check_guild_membership(bot, discord_id: str) -> str:
