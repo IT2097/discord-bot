@@ -1,0 +1,56 @@
+/* ライトモードの配色（style.css のダーク配色を上書きする） */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f3f4f9;
+  --surface: #ffffff;
+  --surface-hover: #eceef7;
+  --border: #d9dce6;
+  --accent: #5865f2;
+  --accent-soft: #4752c4;
+  --status-open: #23a55a;
+  --status-pending: #d9a400;
+  --text: #1f2230;
+  --text-muted: #5c6273;
+  --danger: #d83c3e;
+}
+
+:root[data-theme="light"] body {
+  background:
+    radial-gradient(circle at 15% 0%, rgba(88, 101, 242, 0.10), transparent 55%),
+    var(--bg);
+}
+
+:root[data-theme="light"] .card { box-shadow: 0 1px 3px rgba(20, 22, 40, 0.06); }
+
+:root[data-theme="light"] .filter-input,
+:root[data-theme="light"] .filter-select {
+  background: var(--surface);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+:root[data-theme="light"] .known-btn { border-color: #a9aebf; color: #a9aebf; }
+:root[data-theme="light"] .known-btn[aria-pressed="true"],
+:root[data-theme="light"] .known-btn.sample { color: #fff; border-color: var(--status-open); }
+
+:root[data-theme="light"] #toast { box-shadow: 0 4px 14px rgba(20, 22, 40, 0.12); }
+
+/* エラー画面 */
+:root[data-theme="light"] .error-account { background: var(--surface-hover); }
+:root[data-theme="light"] .error-account .avatar { background: var(--border); }
+:root[data-theme="light"] .error-actions a { border-color: var(--border); }
+:root[data-theme="light"] .error-actions a.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* 切り替えボタン（ダーク・ライト共通） */
+.theme-toggle {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.theme-toggle:hover { border-color: var(--accent); }
