@@ -5,6 +5,8 @@
 
 import os
 import asyncio
+from datetime import datetime, timedelta, timezone
+
 import discord
 
 import match_store
@@ -189,6 +191,16 @@ async def create_match_channel(
 # 以前に投稿したボタンが押せるようにしている。
 # 申請の中身（誰から誰へ・いつ・状態）は match_store がスプレッドシートに保存している。
 # ---------------------------------------------------------------------------
+
+_JST = timezone(timedelta(hours=9))
+_WEEKDAYS = "月火水木金土日"
+
+
+def _format_jst(timestamp: float) -> str:
+    """日時を日本時間・日本語の表記にする（例：2026年10月28日(水) 17:04）。"""
+    dt = datetime.fromtimestamp(timestamp, _JST)
+    return f"{dt.year}年{dt.month}月{dt.day}日({_WEEKDAYS[dt.weekday()]}) {dt:%H:%M}"
+
 
 _EXPIRED_TEXT = "この申請は有効期限（7日間）が切れています。申請者は、もう一度申請し直すことができます。"
 _DONE_TEXT = "この申請はすでに対応済みです。"
@@ -449,7 +461,7 @@ async def send_match_request_to_channel(bot: discord.Client, requester_id: str, 
     request = await asyncio.to_thread(match_store.get_request, request_id)
     expires_text = ""
     if request:
-        expires_text = f"\n（有効期限：<t:{int(request['expires_at'])}:f> まで）"
+        expires_text = f"\n（有効期限：{_format_jst(request['expires_at'])} まで）"
 
     try:
         message = await channel.send(
@@ -524,7 +536,7 @@ async def process_pending_requests(bot: discord.Client):
             try:
                 await message.reply(
                     f"<@{request['target_id']}> 未対応のマッチング申請があります。"
-                    f"<t:{int(request['expires_at'])}:R> に期限が切れるので、承認するか断るかを選んでください。",
+                    f"{_format_jst(request['expires_at'])} に期限が切れるので、承認するか断るかを選んでください。",
                     mention_author=False,
                 )
             except discord.HTTPException:
