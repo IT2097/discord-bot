@@ -19,6 +19,19 @@
     }
     .more-btn:hover { text-decoration: underline; }
     .card .request-btn { margin-top: auto; }
+    /* 申請ボタンと取り消しボタン（状態に合わせて片方だけ表示） */
+    .request-actions { margin-top: auto; display: flex; flex-direction: column; gap: 8px; }
+    .request-actions .request-btn { margin-top: 0; width: 100%; }
+    .request-actions[data-state="open"] .waiting-btn,
+    .request-actions[data-state="open"] .cancel-btn,
+    .request-actions[data-state="pending"] .send-btn { display: none; }
+    .cancel-btn {
+      padding: 6px 0; border: none; background: none; font-family: inherit;
+      color: var(--text-muted); font-size: 12px; cursor: pointer;
+      text-decoration: underline; text-underline-offset: 3px;
+    }
+    .cancel-btn:hover { color: var(--danger, #ed4245); }
+    .cancel-btn:disabled { cursor: default; opacity: 0.6; }
   </style>
 </head>
 <body>
@@ -80,11 +93,11 @@
 
         <div class="status">
           {% if member.discord_id in matched %}
-            <span class="dot matched"></span> マッチング中
+            <span class="dot matched"></span> <span class="status-text">マッチング中</span>
           {% elif member.discord_id in pending %}
-            <span class="dot pending"></span> 申請中
+            <span class="dot pending"></span> <span class="status-text">申請中</span>
           {% else %}
-            <span class="dot"></span> 申請可能
+            <span class="dot"></span> <span class="status-text">申請可能</span>
           {% endif %}
         </div>
 
@@ -104,10 +117,12 @@
 
         {% if member.discord_id in matched %}
           <button class="request-btn" disabled>マッチング中</button>
-        {% elif member.discord_id in pending %}
-          <button class="request-btn" disabled>返信待ちです</button>
         {% else %}
-          <button class="request-btn" data-target="{{ member.discord_id }}">マッチング希望を送る</button>
+          <div class="request-actions" data-target="{{ member.discord_id }}" data-state="{{ 'pending' if member.discord_id in pending else 'open' }}">
+            <button class="request-btn send-btn" type="button">マッチング希望を送る</button>
+            <button class="request-btn waiting-btn" type="button" disabled>返信待ちです</button>
+            <button class="cancel-btn" type="button">申請を取り消す</button>
+          </div>
         {% endif %}
       </div>
       {% endfor %}
@@ -195,31 +210,57 @@
       if (el) el.addEventListener('input', updateClamps);
     });
 
-    document.querySelectorAll('.request-btn[data-target]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const targetId = btn.dataset.target;
-        btn.disabled = true;
-        btn.textContent = '送信中…';
+    function setRequestState(actions, state) {
+      actions.dataset.state = state;
+      const card = actions.closest('.card');
+      const dot = card.querySelector('.status .dot');
+      const text = card.querySelector('.status .status-text');
+      if (dot) dot.classList.toggle('pending', state === 'pending');
+      if (text) text.textContent = state === 'pending' ? '申請中' : '申請可能';
+    }
 
+    document.querySelectorAll('.request-actions').forEach((actions) => {
+      const targetId = actions.dataset.target;
+      const sendBtn = actions.querySelector('.send-btn');
+      const cancelBtn = actions.querySelector('.cancel-btn');
+
+      sendBtn.addEventListener('click', async () => {
+        sendBtn.disabled = true;
+        sendBtn.textContent = '送信中…';
         try {
           const res = await fetch(`/request/${targetId}`, { method: 'POST' });
           const data = await res.json();
-
           showToast(data.message);
+          // すでに申請中だった場合（別のタブから送った等）も「返信待ち」にそろえる
+          if (data.ok || res.status === 409) setRequestState(actions, 'pending');
+        } catch (err) {
+          showToast('通信エラーが発生しました。');
+        }
+        sendBtn.disabled = false;
+        sendBtn.textContent = 'マッチング希望を送る';
+      });
 
-          if (data.ok) {
-            btn.textContent = '返信待ちです';
-            const dot = btn.closest('.card').querySelector('.dot');
-            dot.classList.add('pending');
-          } else {
-            btn.disabled = false;
-            btn.textContent = 'マッチング希望を送る';
+      cancelBtn.addEventListener('click', async () => {
+        const name = actions.closest('.card').querySelector('.name').textContent.trim();
+        if (!confirm(`${name} さんへのマッチング申請を取り消しますか？\n承認チャンネルに投稿された通知も削除されます。`)) return;
+
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = '取り消し中…';
+        try {
+          const res = await fetch(`/request/${targetId}/cancel`, { method: 'POST' });
+          const data = await res.json();
+          showToast(data.message);
+          if (data.ok || data.state === 'open') {
+            setRequestState(actions, 'open');
+          } else if (data.state === 'matched') {
+            // 取り消す前に相手が承認していた場合は、ページを読み込み直して最新の状態を出す
+            setTimeout(() => location.reload(), 1500);
           }
         } catch (err) {
           showToast('通信エラーが発生しました。');
-          btn.disabled = false;
-          btn.textContent = 'マッチング希望を送る';
         }
+        cancelBtn.disabled = false;
+        cancelBtn.textContent = '申請を取り消す';
       });
     });
   </script>
