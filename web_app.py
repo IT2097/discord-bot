@@ -14,6 +14,7 @@ import requests
 from flask import Flask, redirect, render_template, request, session, url_for, flash
 
 import sheets_client
+import known_store
 import match_store
 
 DISCORD_API_BASE = "https://discord.com/api"
@@ -86,6 +87,11 @@ def create_app(bot, run_coro):
 
         pending = match_store.pending_targets_for(my_id)
         matched = match_store.matched_targets_for(my_id)
+        try:
+            known = known_store.known_targets_for(my_id)
+        except Exception as error:  # noqa: BLE001 - チェックが読めなくても一覧ページ自体は表示する
+            print(f"知り合いチェックの読み込みに失敗しました：{error}")
+            known = set()
 
         other_members = [m for m in members if m["discord_id"] != str(my_id)]
 
@@ -116,10 +122,12 @@ def create_app(bot, run_coro):
 
         return render_template(
             "index.html",
+            my_id=str(my_id),
             my_name=my_name,
             members=other_members,
             pending=pending,
             matched=matched,
+            known=known,
             ages=ages,
             genders=genders,
             prefectures=prefectures,
@@ -261,6 +269,21 @@ def create_app(bot, run_coro):
 
         return {"ok": True, "message": "マッチング申請を送信しました！"}
 
+    @app.route("/known/<target_id>", methods=["POST"])
+    def set_known(target_id):
+        if "discord_id" not in session:
+            return {"ok": False, "message": "ログインしてください。"}, 401
+
+        data = request.get_json(silent=True) or {}
+        want = bool(data.get("known"))
+        try:
+            known = known_store.set_known(session["discord_id"], target_id, want)
+        except Exception as error:  # noqa: BLE001
+            return {"ok": False, "message": f"チェックの保存に失敗しました：{error}"}, 500
+
+        message = "知り合いとしてチェックしました" if known else "チェックを外しました"
+        return {"ok": True, "known": known, "message": message}
+
     @app.route("/request/<target_id>/cancel", methods=["POST"])
     def cancel_request(target_id):
         if "discord_id" not in session:
@@ -268,18 +291,18 @@ def create_app(bot, run_coro):
 
         my_id = session["discord_id"]
 
-        request = match_store.find_pending_request(my_id, target_id)
-        if request is None:
+        pending_req = match_store.find_pending_request(my_id, target_id)
+        if pending_req is None:
             if str(target_id) in match_store.matched_targets_for(my_id):
                 return {"ok": False, "state": "matched", "message": "相手がすでに承認しているため、取り消せませんでした。"}, 409
             return {"ok": False, "state": "open", "message": "取り消せる申請がありません（すでに断られたか、期限が切れています）。"}, 409
 
         # 先に「取消」にしておくことで、削除中に相手が承認ボタンを押しても承認されないようにする
-        if match_store.resolve_request(request["request_id"], match_store.STATUS_CANCELLED) is None:
+        if match_store.resolve_request(pending_req["request_id"], match_store.STATUS_CANCELLED) is None:
             return {"ok": False, "state": "matched", "message": "相手がちょうど返事をしたため、取り消せませんでした。"}, 409
 
         try:
-            run_coro(_delete_request_notice(bot, request))
+            run_coro(_delete_request_notice(bot, pending_req))
         except Exception as error:  # noqa: BLE001 - 申請の取り消し自体は済んでいる
             print(f"取り消した申請のメッセージ削除に失敗しました：{error}")
 
