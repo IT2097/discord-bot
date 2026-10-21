@@ -32,6 +32,47 @@
     }
     .cancel-btn:hover { color: var(--danger, #ed4245); }
     .cancel-btn:disabled { cursor: default; opacity: 0.6; }
+
+    /* 知り合いチェック */
+    .known-btn {
+      flex-shrink: 0; align-self: flex-start;
+      width: 30px; height: 30px; border-radius: 50%;
+      border: 1.5px solid #5a5f75; background: transparent;
+      color: #5a5f75; font-size: 15px; font-weight: 700; line-height: 1;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }
+    .known-btn:hover { border-color: var(--status-open); color: var(--text-muted); }
+    .known-btn[aria-pressed="true"], .known-btn.sample {
+      background: var(--status-open); border-color: var(--status-open); color: #14151f;
+    }
+    .known-btn.sample { cursor: default; width: 26px; height: 26px; font-size: 13px; }
+    .card.known { opacity: 0.6; }
+    .card.known:hover { opacity: 1; }
+    .known-label { display: none; }
+    .card.known .request-actions[data-state="open"] .send-btn { display: none; }
+    .card.known .request-actions[data-state="open"] .known-label { display: block; }
+
+    .known-guide {
+      display: flex; gap: 12px; align-items: flex-start;
+      margin: 0 0 20px; padding: 14px 16px;
+      border: 1px solid var(--border); border-radius: 12px;
+      background: var(--surface); font-size: 13px; color: var(--text);
+    }
+    .known-guide p { margin: 0; line-height: 1.7; }
+    .known-guide .known-note { display: block; margin-top: 4px; font-size: 12px; color: var(--text-muted); }
+
+    /* トップに戻るボタン */
+    #back-to-top {
+      position: fixed; right: 18px; bottom: 22px; z-index: 50;
+      width: 48px; height: 48px; border-radius: 50%; border: none;
+      background: var(--accent); color: #fff; font-size: 20px; font-weight: 700;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35); cursor: pointer;
+      opacity: 0; visibility: hidden; transform: translateY(8px);
+      transition: opacity 0.2s ease, transform 0.2s ease, visibility 0.2s;
+    }
+    #back-to-top.show { opacity: 0.7; visibility: visible; transform: translateY(0); }
+    #back-to-top.show:hover { opacity: 1; }
   </style>
 </head>
 <body>
@@ -48,6 +89,15 @@
     </div>
 
     {% if members %}
+    <div class="known-guide">
+      <span class="known-btn sample" aria-hidden="true">✓</span>
+      <p>
+        <strong>すでに知り合いの人には、チェックを付けておきましょう。</strong><br>
+        カード右上の <b>✓</b> を押すと「マッチング希望を送る」ボタンが押せなくなり、間違えて申請するのを防げます。もう一度押すと外れます。
+        <span class="known-note">チェックはスマホ・パソコンどちらで開いても同じ状態で表示されます。相手には伝わりません。</span>
+      </p>
+    </div>
+
     <div class="filters">
       <input type="text" id="keyword-search" class="filter-input" placeholder="キーワードで検索（名前・業種・事業内容）">
       <select id="filter-age" class="filter-select">
@@ -72,11 +122,12 @@
 
     <div class="grid" id="member-grid">
       {% for member in members %}
-      <div class="card"
+      <div class="card{{ ' known' if member.discord_id in known and member.discord_id not in matched else '' }}"
            data-search="{{ member.search_blob }}"
            data-age="{{ member.age }}"
            data-gender="{{ member.gender }}"
-           data-prefecture="{{ member.prefecture }}">
+           data-prefecture="{{ member.prefecture }}"
+           data-id="{{ member.discord_id }}">
         <div class="card-top">
           <div class="identity">
             {% if member.avatar_url %}
@@ -89,6 +140,9 @@
               <div class="meta">{{ [member.age, member.gender, (member.prefecture ~ member.city)] | select | join(' ・ ') }}</div>
             </div>
           </div>
+          {% if member.discord_id not in matched %}
+          <button class="known-btn" type="button" aria-pressed="{{ 'true' if member.discord_id in known else 'false' }}" title="{{ 'チェックを外す' if member.discord_id in known else '知り合いとしてチェック' }}" aria-label="{{ member.name }} さんを知り合いとしてチェック">✓</button>
+          {% endif %}
         </div>
 
         <div class="status">
@@ -120,6 +174,7 @@
         {% else %}
           <div class="request-actions" data-target="{{ member.discord_id }}" data-state="{{ 'pending' if member.discord_id in pending else 'open' }}">
             <button class="request-btn send-btn" type="button">マッチング希望を送る</button>
+            <button class="request-btn known-label" type="button" disabled>知り合いのため申請しません</button>
             <button class="request-btn waiting-btn" type="button" disabled>返信待ちです</button>
             <button class="cancel-btn" type="button">申請を取り消す</button>
           </div>
@@ -134,6 +189,8 @@
   </div>
 
   <div id="toast"></div>
+
+  <button id="back-to-top" type="button" aria-label="ページのトップに戻る">↑</button>
 
   <script>
     const toast = document.getElementById('toast');
@@ -262,6 +319,66 @@
         cancelBtn.disabled = false;
         cancelBtn.textContent = '申請を取り消す';
       });
+    });
+
+    // --- 知り合いチェック（サーバーに保存するので、どの端末でも同じ状態になる） ---
+    document.querySelectorAll('.card .known-btn').forEach((btn) => {
+      const card = btn.closest('.card');
+      const id = card.dataset.id;
+      const apply = (known) => {
+        card.classList.toggle('known', known);
+        btn.setAttribute('aria-pressed', String(known));
+        btn.title = known ? 'チェックを外す' : '知り合いとしてチェック';
+      };
+
+      btn.addEventListener('click', async () => {
+        if (btn.disabled) return;
+        const before = btn.getAttribute('aria-pressed') === 'true';
+        apply(!before);  // 先に見た目を切り替えて、保存に失敗したら元に戻す
+        btn.disabled = true;
+        try {
+          const res = await fetch(`/known/${id}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ known: !before }),
+          });
+          const data = await res.json();
+          if (data.ok) {
+            apply(data.known);
+          } else {
+            apply(before);
+          }
+          showToast(data.message);
+        } catch (err) {
+          apply(before);
+          showToast('通信エラーのため、チェックを保存できませんでした。');
+        }
+        btn.disabled = false;
+      });
+    });
+
+    // --- トップに戻るボタン ---
+    const backToTop = document.getElementById('back-to-top');
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    function toggleBackToTop() {
+      backToTop.classList.toggle('show', window.scrollY > 300);
+    }
+    window.addEventListener('scroll', toggleBackToTop, { passive: true });
+    toggleBackToTop();
+
+    backToTop.addEventListener('click', () => {
+      const start = window.scrollY;
+      if (reduceMotion || start === 0) { window.scrollTo(0, 0); return; }
+      const duration = Math.min(450, 250 + start / 20);  // 長いページでも0.45秒以内
+      const t0 = performance.now();
+      const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+      function step(now) {
+        const t = Math.min(1, (now - t0) / duration);
+        window.scrollTo(0, Math.round(start * (1 - easeOut(t))));
+        if (t < 1) requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
     });
   </script>
 </body>
