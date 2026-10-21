@@ -27,7 +27,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-16b マッチングルームDM通知版"
+BOT_VERSION = "2026-10-21 id同期ログ名の絵文字対応版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -38,6 +38,21 @@ ID_SYNC_LOG_CHANNEL_NAME = os.getenv("ID_SYNC_LOG_CHANNEL_NAME", "id同期ログ
 
 # DMではなく、名前登録チャンネル内でメンション付きで通知するために使うチャンネル名
 NAME_REGISTER_CHANNEL_NAME = os.getenv("NAME_REGISTER_CHANNEL_NAME", "名前登録")
+
+
+def find_id_sync_log_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    """
+    「id同期ログ」チャンネルを探す。
+    名前が完全に一致するものを優先し、なければ「id同期ログ」で始まる名前のチャンネルを使う。
+    （「id同期ログ🔒」のように後ろに絵文字などを付けても、そのまま見つけられるようにするため）
+    """
+    exact = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
+    if exact is not None:
+        return exact
+    return next(
+        (ch for ch in guild.text_channels if ch.name.startswith(ID_SYNC_LOG_CHANNEL_NAME)),
+        None,
+    )
 
 # 参加直後に自動付与し、本名登録が終わったら自動で外すロール名
 # （名前登録チャンネルも含め、すべてのチャンネルをこのロールから見えなくする想定。
@@ -737,7 +752,7 @@ class NameModal(discord.ui.Modal, title="名前を登録"):
         )
 
         # すでにスプレッドシートに同名の行があるか、その場で同期を試みる
-        channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
+        channel = find_id_sync_log_channel(guild)
 
         async def send(*args, **kwargs):
             if channel is not None:
@@ -1147,8 +1162,16 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     if before.nick == after.nick:
         return
 
+    # サーバーに入った直後の人（名前登録がまだの人）は対象外にする。
+    # 参加直後に他のbotやDiscordの機能でニックネームが変わっても、id同期ログが動かないようにするため。
+    # 名前登録フォームから登録した場合は、フォーム側で1回だけ同期するので、ここで二重に動かす必要もない。
+    if any(role.name == UNVERIFIED_ROLE_NAME for role in after.roles):
+        return
+    if after.joined_at and datetime.now(timezone.utc) - after.joined_at < timedelta(minutes=10):
+        return
+
     guild = after.guild
-    channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
+    channel = find_id_sync_log_channel(guild)
 
     async def send(*args, **kwargs):
         if channel is not None:
@@ -1169,7 +1192,7 @@ async def run_member_archive(guild: discord.Guild, discord_id: str, display_name
     退会者の行を「入力シート」から「退会者」シートへ移し、結果を id同期ログ に通知する。
     on_member_remove（キック・自主退会）と、手動の「!退会処理」の両方から呼び出す。
     """
-    channel = discord.utils.get(guild.text_channels, name=ID_SYNC_LOG_CHANNEL_NAME)
+    channel = find_id_sync_log_channel(guild)
 
     async def send(text: str):
         if channel is not None:
