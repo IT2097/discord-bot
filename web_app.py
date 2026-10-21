@@ -261,6 +261,30 @@ def create_app(bot, run_coro):
 
         return {"ok": True, "message": "マッチング申請を送信しました！"}
 
+    @app.route("/request/<target_id>/cancel", methods=["POST"])
+    def cancel_request(target_id):
+        if "discord_id" not in session:
+            return {"ok": False, "message": "ログインしてください。"}, 401
+
+        my_id = session["discord_id"]
+
+        request = match_store.find_pending_request(my_id, target_id)
+        if request is None:
+            if str(target_id) in match_store.matched_targets_for(my_id):
+                return {"ok": False, "state": "matched", "message": "相手がすでに承認しているため、取り消せませんでした。"}, 409
+            return {"ok": False, "state": "open", "message": "取り消せる申請がありません（すでに断られたか、期限が切れています）。"}, 409
+
+        # 先に「取消」にしておくことで、削除中に相手が承認ボタンを押しても承認されないようにする
+        if match_store.resolve_request(request["request_id"], match_store.STATUS_CANCELLED) is None:
+            return {"ok": False, "state": "matched", "message": "相手がちょうど返事をしたため、取り消せませんでした。"}, 409
+
+        try:
+            run_coro(_delete_request_notice(bot, request))
+        except Exception as error:  # noqa: BLE001 - 申請の取り消し自体は済んでいる
+            print(f"取り消した申請のメッセージ削除に失敗しました：{error}")
+
+        return {"ok": True, "state": "open", "message": "マッチング申請を取り消しました。"}
+
     return app
 
 
@@ -312,3 +336,9 @@ async def _notify_match_request(bot, requester_id: str, target_id: str, request_
     import match_views
 
     await match_views.send_match_request_to_channel(bot, requester_id, target_id, request_id)
+
+
+async def _delete_request_notice(bot, request: dict):
+    import match_views
+
+    await match_views.delete_cancelled_request_message(bot, request)

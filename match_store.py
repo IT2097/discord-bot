@@ -271,6 +271,20 @@ def resolve_request(request_id: str, status: str = STATUS_CANCELLED) -> dict | N
         return _public(req)
 
 
+def find_pending_request(requester_id: str, target_id: str) -> dict | None:
+    """申請者→相手の、承認待ち中の申請を1件返す（なければ None）。取り消しボタン用。"""
+    with _lock:
+        _ensure_loaded_locked()
+        for req in _requests.values():
+            if (
+                req["requester_id"] == str(requester_id)
+                and req["target_id"] == str(target_id)
+                and _effective_status(req) == STATUS_PENDING
+            ):
+                return _public(req)
+        return None
+
+
 def pending_targets_for(requester_id: str) -> set[str]:
     """指定した申請者が、現在承認待ち中の相手IDの集合を返す（会員一覧ページの「申請中」表示用）。"""
     with _lock:

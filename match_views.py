@@ -213,6 +213,11 @@ async def _load_request_for_target(interaction: discord.Interaction, request_id:
         await _close_request_message(interaction.message, "⌛ 有効期限が切れました")
         return None
 
+    if request["status"] == match_store.STATUS_CANCELLED:
+        await interaction.response.send_message("この申請は、申請者が取り消しました。", ephemeral=True)
+        await _delete_request_message(interaction.message, "↩️ 申請者が取り消しました")
+        return None
+
     if request["status"] != match_store.STATUS_PENDING:
         await interaction.response.send_message(_DONE_TEXT, ephemeral=True)
         return None
@@ -233,7 +238,7 @@ async def _close_request_message(message: discord.Message | None, note: str):
         pass
 
 
-async def _delete_request_message(message: discord.Message | None):
+async def _delete_request_message(message: discord.Message | None, fallback_note: str = "✅ 承認されました"):
     """
     承認チャンネルの申請メッセージを削除する。
     その申請に返信する形で送ったリマインドのメッセージも、あわせて削除する。
@@ -255,7 +260,7 @@ async def _delete_request_message(message: discord.Message | None):
     try:
         await message.delete()
     except discord.HTTPException:
-        await _close_request_message(message, "✅ 承認されました")
+        await _close_request_message(message, fallback_note)
 
 
 async def _handle_approve(interaction: discord.Interaction, request_id: str):
@@ -464,6 +469,15 @@ async def send_match_request_to_channel(bot: discord.Client, requester_id: str, 
         await asyncio.to_thread(match_store.set_request_message, request_id, channel.id, message.id)
     except Exception as error:  # noqa: BLE001 - 記録に失敗しても申請自体は届いている
         print(f"申請メッセージの記録に失敗しました：{error}")
+
+
+async def delete_cancelled_request_message(bot: discord.Client, request: dict):
+    """
+    申請者が取り消した申請の、承認チャンネルのメッセージ（とリマインド）を削除する。
+    削除できなかった場合は、ボタンを押せなくして「取り消されました」と追記する。
+    """
+    message = await _fetch_request_message(bot, request)
+    await _delete_request_message(message, "↩️ 申請者が取り消しました")
 
 
 # ---------------------------------------------------------------------------
