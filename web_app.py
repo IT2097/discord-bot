@@ -276,6 +276,12 @@ def create_app(bot, run_coro):
 
         data = request.get_json(silent=True) or {}
         want = bool(data.get("known"))
+        if want and match_store.find_pending_request(session["discord_id"], target_id):
+            return {
+                "ok": False,
+                "known": False,
+                "message": "マッチング申請中の人にはチェックを付けられません。付けたい場合は、先に「申請を取り消す」を押してください。",
+            }, 409
         try:
             known = known_store.set_known(session["discord_id"], target_id, want)
         except Exception as error:  # noqa: BLE001
