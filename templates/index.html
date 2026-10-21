@@ -48,6 +48,16 @@
     }
     .known-btn.sample { cursor: default; width: 26px; height: 26px; font-size: 13px; }
     .card.known { opacity: 0.6; }
+    /* 申請中の人にはチェックを付けられない（押すとエラーを表示） */
+    .card:has(.request-actions[data-state="pending"]) .known-btn[aria-pressed="false"] { opacity: 0.35; cursor: not-allowed; }
+    .known-btn.shake { animation: known-shake 0.3s ease; }
+    @keyframes known-shake { 25% { transform: translateX(-3px); } 75% { transform: translateX(3px); } }
+    .filter-check {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 13px; color: var(--text); cursor: pointer; white-space: nowrap;
+    }
+    .filter-check input { width: 16px; height: 16px; accent-color: var(--status-open); margin: 0; }
+    .me { flex-wrap: wrap; }
     .card.known:hover { opacity: 1; }
     .known-label { display: none; }
     .card.known .request-actions[data-state="open"] .send-btn { display: none; }
@@ -74,6 +84,8 @@
     #back-to-top.show { opacity: 0.7; visibility: visible; transform: translateY(0); }
     #back-to-top.show:hover { opacity: 1; }
   </style>
+  <link rel="stylesheet" href="{{ url_for('static', filename='theme.css') }}">
+  <script src="{{ url_for('static', filename='theme.js') }}"></script>
 </head>
 <body>
   <div class="page">
@@ -83,6 +95,7 @@
         <h1>マッチング会員一覧</h1>
       </div>
       <div class="me">
+        <button id="theme-toggle" class="theme-toggle" type="button">☀️ ライトモード</button>
         <span>{{ my_name }} としてログイン中</span>
         <a href="{{ url_for('logout') }}">ログアウト</a>
       </div>
@@ -118,6 +131,10 @@
         <option value="{{ prefecture }}">{{ prefecture }}</option>
         {% endfor %}
       </select>
+      <label class="filter-check">
+        <input type="checkbox" id="filter-hide-known">
+        チェック済みの人を表示しない
+      </label>
     </div>
 
     <div class="grid" id="member-grid">
@@ -209,12 +226,14 @@
     const prefectureSelect = document.getElementById('filter-prefecture');
     const memberCards = document.querySelectorAll('#member-grid .card');
     const filterEmpty = document.getElementById('filter-empty');
+    const hideKnownCheck = document.getElementById('filter-hide-known');
 
     function applyFilters() {
       const keyword = keywordInput ? keywordInput.value.trim().toLowerCase() : '';
       const age = ageSelect ? ageSelect.value : '';
       const gender = genderSelect ? genderSelect.value : '';
       const prefecture = prefectureSelect ? prefectureSelect.value : '';
+      const hideKnown = hideKnownCheck ? hideKnownCheck.checked : false;
 
       let visibleCount = 0;
 
@@ -224,7 +243,9 @@
         const matchesGender = !gender || card.dataset.gender === gender;
         const matchesPrefecture = !prefecture || card.dataset.prefecture === prefecture;
 
-        const visible = matchesKeyword && matchesAge && matchesGender && matchesPrefecture;
+        const matchesKnown = !hideKnown || !card.classList.contains('known');
+
+        const visible = matchesKeyword && matchesAge && matchesGender && matchesPrefecture && matchesKnown;
         card.style.display = visible ? '' : 'none';
         if (visible) visibleCount += 1;
       });
@@ -237,6 +258,18 @@
     [keywordInput, ageSelect, genderSelect, prefectureSelect].forEach((el) => {
       if (el) el.addEventListener('input', applyFilters);
     });
+
+    // 「チェック済みの人を表示しない」はこのブラウザに覚えておく
+    const HIDE_KNOWN_KEY = 'matching-board-hide-known';
+    try { if (hideKnownCheck) hideKnownCheck.checked = localStorage.getItem(HIDE_KNOWN_KEY) === '1'; } catch (e) {}
+    if (hideKnownCheck) {
+      hideKnownCheck.addEventListener('change', () => {
+        try { localStorage.setItem(HIDE_KNOWN_KEY, hideKnownCheck.checked ? '1' : '0'); } catch (e) {}
+        applyFilters();
+        updateClamps();
+      });
+    }
+    applyFilters();
 
     // 事業内容が長いカードにだけ「続きを読む」を出す
     function updateClamps() {
@@ -334,6 +367,12 @@
       btn.addEventListener('click', async () => {
         if (btn.disabled) return;
         const before = btn.getAttribute('aria-pressed') === 'true';
+        const actions = card.querySelector('.request-actions');
+        if (!before && actions && actions.dataset.state === 'pending') {
+          showToast('マッチング申請中の人にはチェックを付けられません。付けたい場合は、先に「申請を取り消す」を押してください。');
+          btn.classList.remove('shake'); void btn.offsetWidth; btn.classList.add('shake');
+          return;
+        }
         apply(!before);  // 先に見た目を切り替えて、保存に失敗したら元に戻す
         btn.disabled = true;
         try {
@@ -345,6 +384,7 @@
           const data = await res.json();
           if (data.ok) {
             apply(data.known);
+            applyFilters();
           } else {
             apply(before);
           }
