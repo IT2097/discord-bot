@@ -3,8 +3,8 @@ Discordの「プロフィール編集」から、スプレッドシート（入�
 
 【入力シートの形式（sheets_client.py と同じ考え方）】
 - 1人が「業種・事業内容」の数だけ複数行に分かれている
-- 同じ人の行は「名前（本名）」が同じ。DiscordIDは最初の1行にだけ入っている
-- A列の番号などは数式で自動計算しているので、botは値を書き込まない
+- 同じ人の行は「名前（本名）」が同じ。DiscordIDは全部の行に入っている（古いデータは最初の1行だけのこともある）
+- A列の番号は、業種を追加したときに上の行からコピーする
 
 【このモジュールでできること】
 - 名前・年齢・性別・都道府県・市町村の変更（その人の全部の行をまとめて書き換える）
@@ -42,6 +42,9 @@ FIELD_HEADERS = {
     "city": sheets_client.HEADER_CITY,
 }
 FIELD_LABELS = {"name": "名前", "age": "年齢", "gender": "性別", "prefecture": "都道府県", "city": "市町村"}
+
+# 会員ごとの番号が入っている列（業種を追加したとき、上の行からコピーする）
+NUMBER_COLUMN = os.getenv("NUMBER_COLUMN", "A").strip().upper() or "A"
 
 _lock = threading.Lock()
 _sheet_cache: dict = {"sheet": None}
@@ -231,8 +234,9 @@ def update_fields(discord_id: str, changes: dict) -> dict:
 def add_business(discord_id: str, business_type: str, content: str) -> int:
     """
     その人の最後の行のすぐ下に1行入れ、業種と事業内容を書き込む。
-    名前・年齢・性別・都道府県・市町村は同じ人の他の行からコピーする（DiscordIDは入れない）。
-    A列などの数式の列には書き込まない。戻り値は追加した行番号。
+    名前・年齢・性別・都道府県・市町村・DiscordIDは同じ人の行と同じ値を入れる。
+    番号の列（A列。環境変数 NUMBER_COLUMN で変更可）は、すぐ上の行をそのままコピーする
+    （数式なら数式、手入力の値なら値がコピーされる）。戻り値は追加した行番号。
     """
     business_type, content = _clean(business_type), _clean(content)
     if not business_type and not content:
@@ -276,6 +280,38 @@ def add_business(discord_id: str, business_type: str, content: str) -> int:
         if target != first:
             for header in FIELD_HEADERS.values():
                 values[header] = table.cell(first, header)
+            # DiscordIDも全部の行に入れる（入力シートの今の形式に合わせる）
+            values[sheets_client.HEADER_DISCORD_ID] = str(discord_id)
+
+            # 番号の列は、すぐ上の行（同じ人の最後の行）をコピーする
+            number_col = gspread.utils.a1_to_rowcol(f"{NUMBER_COLUMN}1")[1] - 1  # 0始まり
+            sheet = _get_sheet()
+            _with_retry(
+                sheet.spreadsheet.batch_update,
+                {
+                    "requests": [
+                        {
+                            "copyPaste": {
+                                "source": {
+                                    "sheetId": sheet.id,
+                                    "startRowIndex": last - 1,
+                                    "endRowIndex": last,
+                                    "startColumnIndex": number_col,
+                                    "endColumnIndex": number_col + 1,
+                                },
+                                "destination": {
+                                    "sheetId": sheet.id,
+                                    "startRowIndex": target - 1,
+                                    "endRowIndex": target,
+                                    "startColumnIndex": number_col,
+                                    "endColumnIndex": number_col + 1,
+                                },
+                                "pasteType": "PASTE_NORMAL",
+                            }
+                        }
+                    ]
+                },
+            )
 
         _write_cells(
             [
