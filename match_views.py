@@ -223,6 +223,8 @@ async def _load_request_for_target(interaction: discord.Interaction, request_id:
     if request["status"] == match_store.STATUS_EXPIRED:
         await interaction.response.send_message(_EXPIRED_TEXT, ephemeral=True)
         await _close_request_message(interaction.message, "⌛ 有効期限が切れました")
+        if _is_request_thread(interaction.message):
+            _schedule_thread_removal(interaction.message, None, THREAD_DELETE_DELAY_SECONDS)
         return None
 
     if request["status"] == match_store.STATUS_CANCELLED:
@@ -250,13 +252,62 @@ async def _close_request_message(message: discord.Message | None, note: str):
         pass
 
 
-async def _delete_request_message(message: discord.Message | None, fallback_note: str = "✅ 承認されました"):
+# ---------------------------------------------------------------------------
+# 申請ごとのプライベートスレッド
+#
+# 承認チャンネルに直接投稿すると会員全員に見えてしまうため、申請ごとに
+# 「申請された人だけが入れるプライベートスレッド」を作り、その中にボタンを出す。
+# 申請が終わったら（承認・断る・取り消し・期限切れ）スレッドは削除する。
+# 以前に承認チャンネルへ直接投稿した申請は、これまでどおりメッセージだけを扱う。
+# ---------------------------------------------------------------------------
+
+THREAD_DELETE_DELAY_SECONDS = 60  # 承認・断るを押したあと、結果を読めるよう少し待ってから消す
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _is_request_thread(message: discord.Message | None) -> bool:
+    return message is not None and isinstance(message.channel, discord.Thread)
+
+
+async def _remove_request_thread(message: discord.Message, note: str | None, delay: float):
+    """スレッドのボタンを閉じて結果を書き足し、delay 秒後にスレッドごと削除する。"""
+    thread = message.channel
+    if note:
+        await _close_request_message(message, note)
+    if delay:
+        await asyncio.sleep(delay)
+    try:
+        await thread.delete()
+    except discord.HTTPException:
+        # 削除できない（権限不足など）ときは、せめてアーカイブ・ロックして一覧から消す
+        try:
+            await thread.edit(archived=True, locked=True)
+        except discord.HTTPException:
+            pass
+
+
+def _schedule_thread_removal(message: discord.Message, note: str | None, delay: float):
+    task = asyncio.create_task(_remove_request_thread(message, note, delay))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _delete_request_message(
+    message: discord.Message | None,
+    fallback_note: str = "✅ 承認されました",
+    thread_delay: float = THREAD_DELETE_DELAY_SECONDS,
+):
     """
     承認チャンネルの申請メッセージを削除する。
+    申請がプライベートスレッドの中にある場合は、結果を書き足してから thread_delay 秒後にスレッドごと削除する。
     その申請に返信する形で送ったリマインドのメッセージも、あわせて削除する。
     削除できなかった場合は、ボタンを押せなくして「承認されました」と追記する。
     """
     if message is None:
+        return
+
+    if _is_request_thread(message):
+        _schedule_thread_removal(message, fallback_note if thread_delay else None, thread_delay)
         return
 
     try:
@@ -344,6 +395,8 @@ async def _handle_reject(interaction: discord.Interaction, request_id: str):
         return
     await _close_request_message(interaction.message, "見送りになりました")
     await interaction.followup.send("申請を断りました。", ephemeral=True)
+    if _is_request_thread(interaction.message):
+        _schedule_thread_removal(interaction.message, None, THREAD_DELETE_DELAY_SECONDS)
 
     guild = interaction.guild
     if guild is None:
@@ -439,6 +492,46 @@ def _build_request_view(request_id: str, disabled: bool = False) -> discord.ui.V
     return view
 
 
+# 承認チャンネルでbotに必要な権限（申請ごとのプライベートスレッドを作って、終わったら消すため）
+APPROVAL_BOT_PERMISSIONS = dict(
+    view_channel=True,
+    send_messages=True,
+    read_message_history=True,
+    embed_links=True,
+    manage_messages=True,
+    create_private_threads=True,
+    send_messages_in_threads=True,
+    manage_threads=True,
+)
+
+
+async def setup_approval_channel(guild: discord.Guild, member_role: discord.Role | None) -> discord.TextChannel:
+    """
+    承認チャンネルの権限を「申請ごとのプライベートスレッド」方式に合わせて設定する。
+    - bot：スレッドの作成・削除ができる
+    - @everyone：見えない
+    - 会員ロール：チャンネルは見えるが、投稿やスレッドの作成はできない
+      （自分が追加されたスレッド＝自分宛ての申請だけが見える）
+    """
+    channel = discord.utils.get(guild.text_channels, name=APPROVAL_CHANNEL_NAME)
+    if channel is None:
+        raise RuntimeError(f"「{APPROVAL_CHANNEL_NAME}」という名前のテキストチャンネルが見つかりません。")
+    await channel.set_permissions(guild.me, **APPROVAL_BOT_PERMISSIONS)
+    await channel.set_permissions(guild.default_role, view_channel=False)
+    if member_role is not None:
+        await channel.set_permissions(
+            member_role,
+            view_channel=True,
+            read_message_history=True,
+            send_messages=False,
+            add_reactions=False,
+            create_public_threads=False,
+            create_private_threads=False,
+            send_messages_in_threads=False,
+        )
+    return channel
+
+
 async def send_match_request_to_channel(bot: discord.Client, requester_id: str, target_id: str, request_id: str):
     """
     Webページからのマッチング申請を、「承認」チャンネルに投稿して通知する。
@@ -464,21 +557,29 @@ async def send_match_request_to_channel(bot: discord.Client, requester_id: str, 
         expires_text = f"\n（有効期限：{_format_jst(request['expires_at'])} まで）"
 
     try:
-        message = await channel.send(
+        # 申請された人だけが見られるプライベートスレッドを作り、その中にボタンを出す
+        thread = await channel.create_thread(
+            name=f"{requester.display_name}さんからのマッチング申請"[:100],
+            type=discord.ChannelType.private_thread,
+            invitable=False,
+            auto_archive_duration=10080,  # 7日間（申請の有効期限と同じ）
+        )
+        await thread.add_user(target)
+        message = await thread.send(
             f"{target.mention}\n{requester.display_name} さんからマッチの依頼が来ました！承認しますか？\n"
-            f"（「プロフィール」ボタンから相手の情報を確認できます）{expires_text}",
+            f"（「プロフィール」ボタンから相手の情報を確認できます）{expires_text}\n"
+            "※このスレッドは、あなたにだけ表示されています。",
             view=_build_request_view(request_id),
         )
     except discord.Forbidden as error:
         raise RuntimeError(
-            f"Botが「{APPROVAL_CHANNEL_NAME}」チャンネルを見る・投稿する権限を持っていません。"
-            "管理者の方は !会員ロール設定 を再実行するか、チャンネルの権限でBotに"
-            "「チャンネルを見る」「メッセージを送信」を許可してください。"
+            f"Botが「{APPROVAL_CHANNEL_NAME}」チャンネルでプライベートスレッドを作る権限を持っていません。"
+            "管理者の方は !承認チャンネル設定 を実行してください。"
         ) from error
 
-    # リマインドと期限切れの表示のために、投稿したメッセージの場所を記録する
+    # リマインドと期限切れの表示のために、投稿したメッセージの場所（スレッドのID）を記録する
     try:
-        await asyncio.to_thread(match_store.set_request_message, request_id, channel.id, message.id)
+        await asyncio.to_thread(match_store.set_request_message, request_id, thread.id, message.id)
     except Exception as error:  # noqa: BLE001 - 記録に失敗しても申請自体は届いている
         print(f"申請メッセージの記録に失敗しました：{error}")
 
@@ -489,7 +590,44 @@ async def delete_cancelled_request_message(bot: discord.Client, request: dict):
     削除できなかった場合は、ボタンを押せなくして「取り消されました」と追記する。
     """
     message = await _fetch_request_message(bot, request)
-    await _delete_request_message(message, "↩️ 申請者が取り消しました")
+    # 取り消した申請は、相手に見せる必要がないのですぐに消す
+    await _delete_request_message(message, "↩️ 申請者が取り消しました", thread_delay=0)
+
+
+async def migrate_approval_channel(bot: discord.Client, channel: discord.TextChannel) -> dict:
+    """
+    以前の方式（承認チャンネルに直接投稿）の申請を、プライベートスレッド方式に移す。
+    - 承認待ちの申請は、スレッドを作って投稿し直し、元のメッセージを消す（相手にはメンション通知がもう一度届く）
+    - 承認チャンネルに残っている、終わった申請やリマインドなどのbotのメッセージは削除する
+    """
+    moved, failed = 0, 0
+    keep_ids: set[int] = set()
+    for request in await asyncio.to_thread(match_store.pending_requests):
+        if request.get("channel_id") != str(channel.id):
+            continue  # すでにスレッド方式の申請
+        old_message = await _fetch_request_message(bot, request)
+        try:
+            await send_match_request_to_channel(
+                bot, request["requester_id"], request["target_id"], request["request_id"]
+            )
+            moved += 1
+        except Exception as error:  # noqa: BLE001 - 1件失敗しても他は続ける
+            print(f"申請 {request['request_id']} の移行に失敗しました：{error}")
+            failed += 1
+            if old_message is not None:
+                keep_ids.add(old_message.id)  # 失敗した申請の元のメッセージは消さずに残す
+            continue
+        if old_message is not None:
+            try:
+                await old_message.delete()
+            except discord.HTTPException:
+                pass
+
+    deleted = await channel.purge(
+        limit=2000,
+        check=lambda m: m.author.id == bot.user.id and m.id not in keep_ids,
+    )
+    return {"moved": moved, "failed": failed, "deleted": len(deleted)}
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +651,10 @@ async def process_pending_requests(bot: discord.Client):
     """
     for request in await asyncio.to_thread(match_store.requests_to_expire):
         message = await _fetch_request_message(bot, request)
-        await _close_request_message(message, "⌛ 有効期限が切れました")
+        if _is_request_thread(message):
+            await _remove_request_thread(message, None, 0)  # 期限切れの申請スレッドは削除する
+        else:
+            await _close_request_message(message, "⌛ 有効期限が切れました")
         await asyncio.to_thread(match_store.mark_expired, request["request_id"])
 
         guild = bot.get_guild(int(GUILD_ID)) if GUILD_ID else None

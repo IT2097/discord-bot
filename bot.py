@@ -30,7 +30,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-25 コミュニティ告知の自動書き換え版"
+BOT_VERSION = "2026-10-25 承認スレッド版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -510,6 +510,14 @@ async def setup_member_role(ctx: commands.Context):
 
     # マッチングルーム・承認などは「会員」ロールだけが見られるようにする
     for channel_name in MEMBER_ONLY_CHANNEL_NAMES:
+        if channel_name == match_views.APPROVAL_CHANNEL_NAME:
+            # 承認チャンネルは申請ごとのプライベートスレッド方式なので、専用の設定にする
+            try:
+                await match_views.setup_approval_channel(ctx.guild, role)
+                count += 1
+            except (RuntimeError, discord.HTTPException):
+                failed += 1
+            continue
         channel = discord.utils.get(ctx.guild.text_channels, name=channel_name)
         if channel is None:
             print(f"「{channel_name}」という名前のテキストチャンネルが見つかりませんでした。")
@@ -547,6 +555,40 @@ async def setup_member_role(ctx: commands.Context):
     if failed:
         message += f"\n⚠️ {failed}件のチャンネルは見つからない、または権限不足のため設定できませんでした。"
     message += "\n" + "\n".join(_format_role_result(role_result))
+    await ctx.send(message)
+
+
+@bot.command(name="承認チャンネル設定")
+@is_admin()
+async def setup_approval_channel_command(ctx: commands.Context):
+    """
+    承認チャンネルを「申請ごとのプライベートスレッド」方式に切り替える管理者向けコマンド。
+    1. チャンネルの権限を設定する（会員は見えるが投稿できない。自分宛ての申請スレッドだけが見える）
+    2. 以前の方式でチャンネルに直接投稿されている承認待ちの申請を、スレッドに移す
+    3. チャンネルに残っている、終わった申請などのbotのメッセージを削除する
+    """
+    role = discord.utils.get(ctx.guild.roles, name=MEMBER_ROLE_NAME)
+    if role is None:
+        await ctx.send(f"「{MEMBER_ROLE_NAME}」ロールが見つかりませんでした。")
+        return
+    await ctx.send("承認チャンネルを設定しています…（承認待ちの申請が多いと少し時間がかかります）")
+    try:
+        channel = await match_views.setup_approval_channel(ctx.guild, role)
+    except (RuntimeError, discord.HTTPException) as error:
+        await ctx.send(f"権限の設定に失敗しました：{error}")
+        return
+    try:
+        result = await match_views.migrate_approval_channel(bot, channel)
+    except discord.HTTPException as error:
+        await ctx.send(f"権限は設定しましたが、申請の移行中にエラーが起きました：{error}")
+        return
+    message = (
+        f"✅ {channel.mention} を設定しました。\n"
+        f"・承認待ちの申請をスレッドに移した件数：{result['moved']}件\n"
+        f"・削除した古いメッセージ：{result['deleted']}件"
+    )
+    if result["failed"]:
+        message += f"\n⚠️ 移せなかった申請が {result['failed']} 件あります（元のメッセージは残しています）。"
     await ctx.send(message)
 
 

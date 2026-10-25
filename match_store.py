@@ -300,6 +300,14 @@ def pending_targets_for(requester_id: str) -> set[str]:
 # リマインド・期限切れの処理（botが定期的に呼び出す）
 # ---------------------------------------------------------------------------
 
+def pending_requests() -> list[dict]:
+    """承認待ち（期限内）の申請をすべて返す（承認チャンネルの移行処理用）。"""
+    now = time.time()
+    with _lock:
+        _ensure_loaded_locked()
+        return [_public(req) for req in _requests.values() if _effective_status(req, now) == STATUS_PENDING]
+
+
 def requests_to_remind() -> list[dict]:
     """3日以上たっていて、まだリマインドしていない承認待ちの申請。"""
     now = time.time()
