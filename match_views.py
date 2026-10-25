@@ -229,7 +229,7 @@ async def _load_request_for_target(interaction: discord.Interaction, request_id:
 
     if request["status"] == match_store.STATUS_CANCELLED:
         await interaction.response.send_message("この申請は、申請者が取り消しました。", ephemeral=True)
-        await _delete_request_message(interaction.message, "↩️ 申請者が取り消しました")
+        await _delete_request_message(interaction.message, "↩️ 申請者が取り消しました", thread_delay=0)
         return None
 
     if request["status"] != match_store.STATUS_PENDING:
@@ -336,8 +336,11 @@ async def _handle_approve(interaction: discord.Interaction, request_id: str):
     if resolved is None:
         await interaction.followup.send(_DONE_TEXT, ephemeral=True)  # 同時に2回押された場合
         return
-    # 承認されたら、承認チャンネルの申請メッセージ（とリマインドの返信）は不要なので削除する
-    await _delete_request_message(interaction.message)
+    # 承認されたら、申請メッセージ（とリマインドの返信）は不要なので削除する。
+    # スレッド方式の申請は、マッチングルームを作り終えてからスレッドごと消す（下の最後）
+    in_thread = _is_request_thread(interaction.message)
+    if not in_thread:
+        await _delete_request_message(interaction.message)
 
     guild = interaction.guild or (interaction.client.get_guild(int(GUILD_ID)) if GUILD_ID else None)
     if guild is None:
@@ -367,6 +370,9 @@ async def _handle_approve(interaction: discord.Interaction, request_id: str):
     await interaction.followup.send(
         f"マッチングが成立しました！ {channel.mention} をご確認ください。", ephemeral=True
     )
+    if in_thread:
+        # 承認が済んだら、申請スレッドはすぐに消す
+        await _remove_request_thread(interaction.message, None, 0)
 
     match_store.mark_matched(request["requester_id"], request["target_id"])
     try:
@@ -396,7 +402,7 @@ async def _handle_reject(interaction: discord.Interaction, request_id: str):
     await _close_request_message(interaction.message, "見送りになりました")
     await interaction.followup.send("申請を断りました。", ephemeral=True)
     if _is_request_thread(interaction.message):
-        _schedule_thread_removal(interaction.message, None, THREAD_DELETE_DELAY_SECONDS)
+        await _remove_request_thread(interaction.message, None, 0)  # 断ったら申請スレッドはすぐに消す
 
     guild = interaction.guild
     if guild is None:
@@ -553,7 +559,7 @@ async def send_match_request_to_channel(bot: discord.Client, requester_id: str, 
 
     request = await asyncio.to_thread(match_store.get_request, request_id)
     expires_text = ""
-    if request:
+    if request and request.get("expires_at"):
         expires_text = f"\n（有効期限：{_format_jst(request['expires_at'])} まで）"
 
     try:
@@ -669,6 +675,24 @@ async def process_pending_requests(bot: discord.Client):
                 "会員一覧ページから、もう一度申請できます。"
             )
         except (discord.NotFound, discord.Forbidden):
+            pass
+
+    # 有効期限が無いので、承認待ちの申請スレッドが7日間の無操作で自動アーカイブ（非表示）に
+    # ならないよう、アーカイブされていたら戻しておく
+    for request in await asyncio.to_thread(match_store.pending_requests):
+        if not request.get("channel_id"):
+            continue
+        try:
+            thread_id = int(request["channel_id"])
+        except ValueError:
+            continue
+        if bot.get_channel(thread_id) is not None:
+            continue  # アーカイブされていないスレッド・通常のチャンネルはbotの手元にある
+        try:
+            channel = await bot.fetch_channel(thread_id)
+            if isinstance(channel, discord.Thread) and channel.archived:
+                await channel.edit(archived=False)
+        except discord.HTTPException:
             pass
 
     for request in await asyncio.to_thread(match_store.requests_to_remind):

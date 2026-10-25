@@ -8,8 +8,8 @@
 再起動しても申請は消えない。
 
 【申請のルール】
-- 有効期限は申請から7日間（REQUEST_EXPIRY_SECONDS）
-- 3日たっても未対応なら、相手に1回だけリマインドする（REMIND_AFTER_SECONDS）
+- 有効期限とリマインドは、2026-10-25 の仕様変更で無しにした（承認・断る・取り消しまで申請は残る）
+  環境変数 REQUEST_EXPIRY_DAYS / REMIND_AFTER_DAYS に日数を入れると、また有効にできる
 - 承認待ちの間は同じ相手に申請し直せない（重複防止）
 - 期限が切れたら、同じ相手にもう一度申請できる
 
@@ -31,8 +31,9 @@ from datetime import datetime, timedelta, timezone
 import gspread
 from google.oauth2.service_account import Credentials
 
-REQUEST_EXPIRY_SECONDS = 7 * 24 * 60 * 60  # 7日間
-REMIND_AFTER_SECONDS = 3 * 24 * 60 * 60  # 3日たったらリマインド
+# 有効期限とリマインド（0なら無し。今は両方とも無し）
+REQUEST_EXPIRY_SECONDS = float(os.getenv("REQUEST_EXPIRY_DAYS", "0")) * 24 * 60 * 60
+REMIND_AFTER_SECONDS = float(os.getenv("REMIND_AFTER_DAYS", "0")) * 24 * 60 * 60
 
 STATUS_PENDING = "承認待ち"
 STATUS_APPROVED = "承認"
@@ -162,7 +163,7 @@ def _save_locked(request_id: str):
 def _effective_status(req: dict, now: float | None = None) -> str:
     """7日を過ぎた「承認待ち」は、シートの更新を待たずに「期限切れ」として扱う。"""
     now = time.time() if now is None else now
-    if req["status"] == STATUS_PENDING and now - req["created_at"] >= REQUEST_EXPIRY_SECONDS:
+    if REQUEST_EXPIRY_SECONDS and req["status"] == STATUS_PENDING and now - req["created_at"] >= REQUEST_EXPIRY_SECONDS:
         return STATUS_EXPIRED
     return req["status"]
 
@@ -170,7 +171,7 @@ def _effective_status(req: dict, now: float | None = None) -> str:
 def _public(req: dict) -> dict:
     data = dict(req)
     data["status"] = _effective_status(req)
-    data["expires_at"] = req["created_at"] + REQUEST_EXPIRY_SECONDS
+    data["expires_at"] = req["created_at"] + REQUEST_EXPIRY_SECONDS if REQUEST_EXPIRY_SECONDS else None
     return data
 
 
@@ -309,7 +310,9 @@ def pending_requests() -> list[dict]:
 
 
 def requests_to_remind() -> list[dict]:
-    """3日以上たっていて、まだリマインドしていない承認待ちの申請。"""
+    """3日以上たっていて、まだリマインドしていない承認待ちの申請（リマインド無しの設定なら空）。"""
+    if not REMIND_AFTER_SECONDS:
+        return []
     now = time.time()
     with _lock:
         _ensure_loaded_locked()
@@ -333,7 +336,9 @@ def mark_reminded(request_id: str):
 
 
 def requests_to_expire() -> list[dict]:
-    """7日を過ぎたのに、シート上はまだ「承認待ち」になっている申請。"""
+    """7日を過ぎたのに、シート上はまだ「承認待ち」になっている申請（有効期限無しの設定なら空）。"""
+    if not REQUEST_EXPIRY_SECONDS:
+        return []
     now = time.time()
     with _lock:
         _ensure_loaded_locked()
