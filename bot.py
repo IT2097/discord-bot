@@ -12,6 +12,7 @@ from discord.ext import commands, tasks
 import match_views
 import match_store
 import match_records
+import inquiry
 import member_archive
 import prefectures
 import profile_edit
@@ -30,7 +31,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-25 承認スレッド版"
+BOT_VERSION = "2026-10-25 問い合わせスレッド版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -590,6 +591,27 @@ async def setup_approval_channel_command(ctx: commands.Context):
     if result["failed"]:
         message += f"\n⚠️ 移せなかった申請が {result['failed']} 件あります（元のメッセージは残しています）。"
     await ctx.send(message)
+
+
+@bot.command(name="問い合わせ設置")
+@is_admin()
+async def post_inquiry_panel(ctx: commands.Context):
+    """
+    打ったチャンネルを「問い合わせ」チャンネルにする管理者向けコマンド（#問い合わせ で打つ想定）。
+    1. 権限を設定する（会員は見えるが投稿できない。自分の問い合わせスレッドの中では返信できる）
+    2. 「📩 運営に問い合わせる」ボタンを設置する
+    問い合わせは、問い合わせた会員と運営（サーバーオーナー）だけが入れるプライベートスレッドで届く。
+    """
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+    role = discord.utils.get(ctx.guild.roles, name=MEMBER_ROLE_NAME)
+    try:
+        await inquiry.setup_inquiry_channel(ctx.channel, role)
+    except discord.HTTPException as error:
+        await ctx.send(f"⚠️ 権限の設定に失敗しました：{error}（このメッセージは1分後に消えます）", delete_after=60)
+    await ctx.send(inquiry.PANEL_TEXT, view=inquiry.InquiryPanel())
 
 
 @bot.command(name="マッチング解除")
@@ -1765,6 +1787,8 @@ async def on_ready():
     bot.add_view(MatchView())
     bot.add_view(NameRegisterView())
     bot.add_view(profile_edit.ProfileEditPanel())
+    bot.add_view(inquiry.InquiryPanel())
+    bot.add_view(inquiry.InquiryResolveView())
     # 承認チャンネルの申請ボタン（承認する・断る・プロフィール）を、再起動後も反応させる
     bot.add_dynamic_items(*match_views.REQUEST_BUTTONS)
     print(f"ログインしました: {bot.user}")
