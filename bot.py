@@ -13,6 +13,9 @@ import match_views
 import match_store
 import match_records
 import member_archive
+import prefectures
+import profile_edit
+import profile_sheet
 import sheet_sync
 import sheets_client
 import web_app
@@ -27,7 +30,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-21 id同期ログ名の絵文字対応版"
+BOT_VERSION = "2026-10-25 コミュニティ告知の自動書き換え版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -53,6 +56,10 @@ def find_id_sync_log_channel(guild: discord.Guild) -> discord.TextChannel | None
         (ch for ch in guild.text_channels if ch.name.startswith(ID_SYNC_LOG_CHANNEL_NAME)),
         None,
     )
+
+
+# プロフィール編集の変更内容も id同期ログ に通知する
+profile_edit.find_log_channel = find_id_sync_log_channel
 
 # 参加直後に自動付与し、本名登録が終わったら自動で外すロール名
 # （名前登録チャンネルも含め、すべてのチャンネルをこのロールから見えなくする想定。
@@ -788,14 +795,10 @@ class NameModal(discord.ui.Modal, title="名前を登録"):
             return
 
         # 既存の行が見つからなかった新規会員には、続けてプロフィールを入力してもらう
-        await interaction.followup.send(
-            "会員情報が見つからなかったため、続けてプロフィールを入力してください。\n"
-            "まずは年齢・性別を選んで「次へ」を押してください。",
-            ephemeral=True,
-            view=ProfileBasicsView(
-                member_id=member.id, name=full_name, business_type_options=business_type_options
-            ),
+        basics_view = ProfileBasicsView(
+            member_id=member.id, name=full_name, business_type_options=business_type_options
         )
+        await interaction.followup.send(basics_view.summary_text(), ephemeral=True, view=basics_view)
 
 
 AGE_OPTIONS = ["10代", "20代", "30代", "40代", "50代", "60代", "70代以上"]
@@ -804,8 +807,10 @@ GENDER_OPTIONS = ["男性", "女性", "その他"]
 
 class ProfileBasicsView(discord.ui.View):
     """
-    新規会員のプロフィール入力（1/3）。年齢・性別をプルダウンで選んでもらい、
-    「次へ」で都道府県・市町村の入力フォーム（2/3）に進む。
+    新規会員のプロフィール入力（1/3）。年齢・性別・都道府県をプルダウンで選んでもらい、
+    「次へ」で市町村の入力フォーム（2/3）に進む。
+    都道府県は47個あり、Discordのプルダウンは25個までなので、2つに分けて表示する
+    （「大阪」「大阪府」のような表記ゆれが出ないよう、自由入力はやめた）。
     """
 
     def __init__(self, member_id: int, name: str, business_type_options: list[str]):
@@ -815,34 +820,79 @@ class ProfileBasicsView(discord.ui.View):
         self.business_type_options = business_type_options
         self.selected_age: str | None = None
         self.selected_gender: str | None = None
+        self.selected_prefecture: str | None = None
 
-    @discord.ui.select(
-        placeholder="年齢を選択",
-        options=[discord.SelectOption(label=age) for age in AGE_OPTIONS],
-    )
-    async def select_age(self, interaction: discord.Interaction, select: discord.ui.Select):
-        self.selected_age = select.values[0]
-        await interaction.response.defer()
+        self.age_select = discord.ui.Select(
+            placeholder="年齢を選択",
+            options=[discord.SelectOption(label=age) for age in AGE_OPTIONS],
+            row=0,
+        )
+        self.age_select.callback = self._on_age
+        self.gender_select = discord.ui.Select(
+            placeholder="性別を選択",
+            options=[discord.SelectOption(label=gender) for gender in GENDER_OPTIONS],
+            row=1,
+        )
+        self.gender_select.callback = self._on_gender
+        self.add_item(self.age_select)
+        self.add_item(self.gender_select)
 
-    @discord.ui.select(
-        placeholder="性別を選択",
-        options=[discord.SelectOption(label=gender) for gender in GENDER_OPTIONS],
-    )
-    async def select_gender(self, interaction: discord.Interaction, select: discord.ui.Select):
-        self.selected_gender = select.values[0]
-        await interaction.response.defer()
+        self.pref_selects = profile_edit.build_prefecture_selects(None, self._on_prefecture)
+        for row, select in enumerate(self.pref_selects, start=2):
+            select.row = row
+            self.add_item(select)
 
-    @discord.ui.button(label="次へ", style=discord.ButtonStyle.primary)
-    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+    def summary_text(self) -> str:
+        return (
+            "会員情報が見つからなかったため、続けてプロフィールを入力してください。\n"
+            "年齢・性別・都道府県を選んで「次へ」を押してください"
+            "（都道府県は、どちらかのプルダウンから選んでください）。\n\n"
+            f"年齢：{self.selected_age or '未選択'}　性別：{self.selected_gender or '未選択'}　"
+            f"都道府県：{self.selected_prefecture or '未選択'}"
+        )
+
+    async def _check_owner(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.member_id:
             await interaction.response.send_message(
                 "この登録フォームはあなた宛てではありません。", ephemeral=True
             )
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        # 選んだものに印を付け直してから表示し直す（表示し直すと選択が消えて見えるのを防ぐ）
+        profile_edit.mark_defaults(self.age_select, self.selected_age)
+        profile_edit.mark_defaults(self.gender_select, self.selected_gender)
+        for select in self.pref_selects:
+            profile_edit.mark_defaults(select, self.selected_prefecture)
+        await interaction.response.edit_message(content=self.summary_text(), view=self)
+
+    async def _on_age(self, interaction: discord.Interaction):
+        if not await self._check_owner(interaction):
+            return
+        self.selected_age = self.age_select.values[0]
+        await self._refresh(interaction)
+
+    async def _on_gender(self, interaction: discord.Interaction):
+        if not await self._check_owner(interaction):
+            return
+        self.selected_gender = self.gender_select.values[0]
+        await self._refresh(interaction)
+
+    async def _on_prefecture(self, interaction: discord.Interaction, value: str):
+        if not await self._check_owner(interaction):
+            return
+        self.selected_prefecture = value
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="次へ", style=discord.ButtonStyle.primary, row=4)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_owner(interaction):
             return
 
-        if not self.selected_age or not self.selected_gender:
+        if not self.selected_age or not self.selected_gender or not self.selected_prefecture:
             await interaction.response.send_message(
-                "年齢と性別の両方を選択してから「次へ」を押してください。", ephemeral=True
+                "年齢・性別・都道府県をすべて選択してから「次へ」を押してください。", ephemeral=True
             )
             return
 
@@ -852,6 +902,7 @@ class ProfileBasicsView(discord.ui.View):
                 name=self.name,
                 age=self.selected_age,
                 gender=self.selected_gender,
+                prefecture=self.selected_prefecture,
                 business_type_options=self.business_type_options,
             )
         )
@@ -859,20 +910,29 @@ class ProfileBasicsView(discord.ui.View):
 
 class ProfileLocationModal(discord.ui.Modal, title="プロフィール入力（続き）"):
     """
-    新規会員のプロフィール入力（2/3）。都道府県・市町村を入力してもらい、
-    続けて業種・事業内容を入力するフォーム（3/3）に進む。
+    新規会員のプロフィール入力（2/3）。市町村を入力してもらい、
+    続けて業種・事業内容を入力するフォーム（3/3）に進む（都道府県は1/3のプルダウンで選択済み）。
     """
 
-    prefecture = discord.ui.TextInput(label="都道府県", placeholder="例：北海道", max_length=10)
     city = discord.ui.TextInput(label="市町村", placeholder="例：札幌市", max_length=20)
 
-    def __init__(self, member_id: int, name: str, age: str, gender: str, business_type_options: list[str]):
+    def __init__(
+        self,
+        member_id: int,
+        name: str,
+        age: str,
+        gender: str,
+        prefecture: str,
+        business_type_options: list[str],
+    ):
         super().__init__()
         self.member_id = member_id
         self.name = name
         self.age = age
         self.gender = gender
+        self.prefecture = prefecture
         self.business_type_options = business_type_options
+        self.city.label = f"市町村（{prefecture}）"
 
     async def on_submit(self, interaction: discord.Interaction):
         base_profile = {
@@ -880,7 +940,7 @@ class ProfileLocationModal(discord.ui.Modal, title="プロフィール入力（�
             "discord_id": str(self.member_id),
             "age": self.age,
             "gender": self.gender,
-            "prefecture": self.prefecture.value.strip(),
+            "prefecture": self.prefecture,
             "city": self.city.value.strip(),
         }
 
@@ -1093,6 +1153,138 @@ for _view_cls in (ProfileBasicsView, BusinessEntryView, NameRegisterView):
     _view_cls.on_error = _view_on_error
 
 
+PROFILE_EDIT_CHANNEL_NAME = os.getenv("PROFILE_EDIT_CHANNEL_NAME", "プロフィール編集")
+
+
+@bot.command(name="プロフィール編集設置")
+@is_admin()
+async def post_profile_edit_button(ctx: commands.Context):
+    """
+    打ったチャンネルに「プロフィールを編集する」ボタンを設置する管理者向けコマンド
+    （「プロフィール編集」チャンネルで打つ想定）。
+    あわせてチャンネルの権限を「会員」ロールだけが見られて、メッセージは送れない形にする。
+    ボタンは永続化されているので、Botが再起動しても反応し続ける。
+    """
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+
+    notes = []
+    role = discord.utils.get(ctx.guild.roles, name=MEMBER_ROLE_NAME)
+    try:
+        await ctx.channel.set_permissions(ctx.guild.me, **BOT_CHANNEL_PERMISSIONS)
+        await ctx.channel.set_permissions(ctx.guild.default_role, view_channel=False)
+        if role is not None:
+            await ctx.channel.set_permissions(
+                role, view_channel=True, send_messages=False, read_message_history=True
+            )
+        else:
+            notes.append(f"「{MEMBER_ROLE_NAME}」ロールが見つからないため、会員への閲覧許可は設定していません。")
+    except discord.HTTPException:
+        notes.append("チャンネルの権限を設定できませんでした（botの権限不足）。手動で設定してください。")
+
+    await ctx.send(
+        "✏️ **プロフィール編集**\n"
+        "下のボタンを押すと、あなたのプロフィールを編集できます（編集画面はあなたにだけ表示されます）。\n"
+        "・名前／年齢・性別／都道府県・市町村の変更\n"
+        "・業種と事業内容の追加・修正・削除\n"
+        "変更した内容は、会員一覧ページにもすぐ反映されます。",
+        view=profile_edit.ProfileEditPanel(),
+    )
+    if notes:
+        await ctx.send("⚠️ " + "\n".join(notes) + "\n（このメッセージは1分後に消えます）", delete_after=60)
+
+
+class PrefectureFixConfirmView(discord.ui.View):
+    """「!都道府県統一」の確認ボタン（コマンドを打った管理者だけが押せる）。"""
+
+    def __init__(self, author_id: int, changes: list):
+        super().__init__(timeout=600)
+        self.author_id = author_id
+        self.changes = changes
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("コマンドを打った管理者だけが押せます。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="この内容で書き換える", style=discord.ButtonStyle.danger)
+    async def apply(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content=interaction.message.content + "\n\n⏳ 書き換えています…", view=None)
+        try:
+            count = await asyncio.to_thread(profile_sheet.apply_prefecture_fix, self.changes)
+        except Exception as error:  # noqa: BLE001
+            await interaction.followup.send(f"書き換えに失敗しました：{error}")
+            return
+        await asyncio.to_thread(sheets_client.get_members, True)
+        skipped = len(self.changes) - count
+        message = f"✅ 都道府県を {count} 件書き換えました。"
+        if skipped:
+            message += f"\n（{skipped} 件は、確認中にシートが変更されていたため書き換えていません。もう一度コマンドを打ってください）"
+        await interaction.followup.send(message)
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content=interaction.message.content + "\n\n取りやめました。", view=None)
+
+
+@bot.command(name="都道府県統一")
+@is_admin()
+async def unify_prefectures(ctx: commands.Context):
+    """
+    入力シートの都道府県の表記ゆれ（「大阪」「東京」など）を「大阪府」「東京都」にそろえる管理者向けコマンド。
+    まず変更予定の一覧を出し、「この内容で書き換える」を押したときだけ書き換える。
+    都道府県と判断できないもの（「札幌」など）は書き換えずに一覧で知らせる。
+    """
+    await ctx.send("入力シートの都道府県を確認しています…")
+    try:
+        plan = await asyncio.to_thread(profile_sheet.plan_prefecture_fix)
+    except Exception as error:  # noqa: BLE001
+        await ctx.send(f"シートの読み込みに失敗しました：{error}")
+        return
+
+    changes, unresolved = plan["changes"], plan["unresolved"]
+
+    # 同じ人・同じ変更は1行にまとめて見やすくする
+    summary: dict[tuple[str, str, str], int] = {}
+    for _row, name, current, fixed in changes:
+        summary[(name, current, fixed)] = summary.get((name, current, fixed), 0) + 1
+    unresolved_summary: dict[tuple[str, str], list[int]] = {}
+    for row, name, current in unresolved:
+        unresolved_summary.setdefault((name, current), []).append(row)
+
+    lines = ["【書き換える予定】"]
+    lines += [f"・{name}：{current} → {fixed}（{n}行）" for (name, current, fixed), n in summary.items()] or ["・なし"]
+    lines.append("")
+    lines.append("【都道府県と判断できなかったもの（書き換えません。スプシで直接直してください）】")
+    lines += [
+        f"・{name}：{current}（{', '.join(str(r) for r in rows)}行目）"
+        for (name, current), rows in unresolved_summary.items()
+    ] or ["・なし"]
+    body = "\n".join(lines)
+
+    if not changes:
+        head = "書き換えが必要な都道府県はありませんでした。"
+        if len(body) > 1800:
+            await ctx.send(head, file=discord.File(io.BytesIO(body.encode("utf-8")), filename="都道府県チェック.txt"))
+        else:
+            await ctx.send(f"{head}\n\n{body}")
+        return
+
+    head = f"都道府県を {len(changes)} 行ぶん書き換えます。内容を確認して、よければ「この内容で書き換える」を押してください。"
+    view = PrefectureFixConfirmView(ctx.author.id, changes)
+    if len(body) > 1700:
+        await ctx.send(
+            head + "\n（一覧が長いのでファイルにしました）",
+            file=discord.File(io.BytesIO(body.encode("utf-8")), filename="都道府県の書き換え予定.txt"),
+            view=view,
+        )
+    else:
+        await ctx.send(f"{head}\n\n{body}", view=view)
+
+
 @bot.command(name="登録ボタン設置")
 @is_admin()
 async def post_register_button(ctx: commands.Context):
@@ -1282,7 +1474,8 @@ async def check_match_requests():
 COMMUNITY_CATEGORY_NAME = os.getenv("COMMUNITY_CATEGORY_NAME", "コミュニティ")
 COMMUNITY_NOTICE_CHANNEL_NAME = os.getenv("COMMUNITY_NOTICE_CHANNEL_NAME", "お知らせ")
 
-_announced_community_ids: set[int] = set()
+# コミュニティID → 「お知らせ」チャンネルに投稿した告知メッセージのID
+_community_announcements: dict[int, int] = {}
 _community_announce_lock = asyncio.Lock()
 
 
@@ -1311,47 +1504,103 @@ async def _community_owners(channel: discord.ForumChannel) -> list[discord.Membe
     return owners
 
 
-async def _already_announced(notice_channel: discord.TextChannel, community: discord.ForumChannel) -> bool:
-    """お知らせチャンネルに、このコミュニティの告知がすでにあるか（再起動しても二重に出さないため）。"""
-    if community.id in _announced_community_ids:
-        return True
-    async for message in notice_channel.history(limit=200):
+async def _find_announcement(
+    notice_channel: discord.TextChannel, community: discord.ForumChannel
+) -> discord.Message | None:
+    """
+    お知らせチャンネルにある、このコミュニティの告知メッセージを探す（無ければ None）。
+    告知を手で削除した場合も None になるので、次に概要を保存したときに投稿し直される。
+    """
+    message_id = _community_announcements.get(community.id)
+    if message_id:
+        try:
+            return await notice_channel.fetch_message(message_id)
+        except discord.NotFound:
+            _community_announcements.pop(community.id, None)
+        except discord.HTTPException:
+            pass
+    async for message in notice_channel.history(limit=500):
         if message.author.id == bot.user.id and community.mention in message.content:
-            _announced_community_ids.add(community.id)
-            return True
-    return False
+            _community_announcements[community.id] = message.id
+            return message
+    return None
 
 
-async def try_announce_community(channel):
-    """条件がそろっていれば、新しいコミュニティを「お知らせ」チャンネルに告知する。"""
+def _community_announcement_text(community: discord.ForumChannel, owners: list[discord.Member], topic: str) -> str:
+    owner_text = "・".join(owner.mention for owner in owners)
+    return (
+        f"🎉 {owner_text}さんが新しいコミュニティを作成しました！\n"
+        f"「{community.mention}」\n\n"
+        f"**概要**\n{topic}"
+    )
+
+
+async def try_announce_community(channel) -> str:
+    """
+    条件（概要と主の両方がそろっている）を満たしていれば、コミュニティを「お知らせ」チャンネルに告知する。
+    すでに告知済みなら、新しく投稿せずに今ある告知メッセージを書き換える
+    （概要の誤字を直したときや、主を追加・変更したときに、告知も自動で直るようにするため）。
+    戻り値：「posted」「edited」「unchanged」「skipped」のどれか（管理者コマンドの結果表示用）。
+    """
     if not _is_community_forum(channel):
-        return
+        return "skipped"
     topic = (channel.topic or "").strip()
     if not topic:
-        return  # 概要（投稿ガイドライン）がまだ入力されていない
+        return "skipped"  # 概要（投稿ガイドライン）がまだ入力されていない
     if len(topic) > 1500:
         topic = topic[:1500] + "…"  # Discordの1メッセージ2000文字の上限に収める
 
     owners = await _community_owners(channel)
     if not owners:
-        return  # 主がまだ追加されていない
+        return "skipped"  # 主がまだ追加されていない
 
     notice_channel = discord.utils.get(channel.category.text_channels, name=COMMUNITY_NOTICE_CHANNEL_NAME)
     if notice_channel is None:
         print(f"「{COMMUNITY_CATEGORY_NAME}」カテゴリに「{COMMUNITY_NOTICE_CHANNEL_NAME}」チャンネルが見つかりません。")
-        return
+        return "skipped"
+
+    text = _community_announcement_text(channel, owners, topic)
 
     async with _community_announce_lock:
-        if await _already_announced(notice_channel, channel):
-            return
-        owner_text = "・".join(owner.mention for owner in owners)
-        await notice_channel.send(
-            f"🎉 {owner_text}さんが新しいコミュニティを作成しました！\n"
-            f"「{channel.mention}」\n\n"
-            f"**概要**\n{topic}",
+        existing = await _find_announcement(notice_channel, channel)
+        if existing is not None:
+            if existing.content == text:
+                return "unchanged"
+            # 書き換えではメンション通知は飛ばない（主にもう一度通知が行くことはない）
+            await existing.edit(content=text, allowed_mentions=discord.AllowedMentions.none())
+            return "edited"
+
+        message = await notice_channel.send(
+            text,
             allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
         )
-        _announced_community_ids.add(channel.id)
+        _community_announcements[channel.id] = message.id
+        return "posted"
+
+
+@bot.command(name="コミュニティ告知")
+@is_admin()
+async def announce_community_command(ctx: commands.Context, community: discord.ForumChannel):
+    """
+    コミュニティの告知を、今の概要と主の内容で投稿（告知が無い場合）または書き換える管理者向けコマンド。
+    例：!コミュニティ告知 #シーシャ
+    告知メッセージを間違えて消してしまったときや、概要を保存しても告知が直らないときに使う。
+    """
+    if not _is_community_forum(community):
+        await ctx.send(f"{community.mention} は「{COMMUNITY_CATEGORY_NAME}」カテゴリのフォーラムではありません。")
+        return
+    try:
+        result = await try_announce_community(community)
+    except discord.HTTPException as error:
+        await ctx.send(f"告知できませんでした：{error}")
+        return
+    messages = {
+        "posted": f"✅ {community.mention} の告知を新しく投稿しました（主にメンション通知が届きます）。",
+        "edited": f"✅ {community.mention} の告知を、今の概要の内容に書き換えました。",
+        "unchanged": f"{community.mention} の告知は、すでに今の概要と同じ内容です。",
+        "skipped": f"{community.mention} は、概要（投稿ガイドライン）か主（権限に追加したメンバー）がまだ設定されていないため告知できません。",
+    }
+    await ctx.send(messages[result])
 
 
 @bot.event
@@ -1473,6 +1722,7 @@ async def on_ready():
     # Railway再起動後も既存ボタンを反応させる
     bot.add_view(MatchView())
     bot.add_view(NameRegisterView())
+    bot.add_view(profile_edit.ProfileEditPanel())
     # 承認チャンネルの申請ボタン（承認する・断る・プロフィール）を、再起動後も反応させる
     bot.add_dynamic_items(*match_views.REQUEST_BUTTONS)
     print(f"ログインしました: {bot.user}")
