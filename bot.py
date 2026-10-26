@@ -31,7 +31,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-25 問い合わせスレッド版"
+BOT_VERSION = "2026-10-26 ルーム一括削除版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -724,6 +724,106 @@ async def organize_match_rooms(ctx: commands.Context):
     if failed:
         message += f"\n⚠️ {failed}件は移動に失敗しました（Botの「チャンネルの管理」権限を確認してください）。"
     await ctx.send(message)
+
+
+class RoomBulkDeleteView(discord.ui.View):
+    """「!ルーム一括削除」の確認ボタン（コマンドを打った管理者だけが押せる）。"""
+
+    def __init__(self, author_id: int, channel_ids: list[int]):
+        super().__init__(timeout=600)
+        self.author_id = author_id
+        self.channel_ids = channel_ids
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("コマンドを打った管理者だけが押せます。", ephemeral=True)
+            return False
+        return True
+
+    async def _run(self, interaction: discord.Interaction, remove_history: bool):
+        await interaction.response.edit_message(
+            content=interaction.message.content + "\n\n⏳ 削除しています…", view=None
+        )
+        deleted, failed, history_removed = 0, 0, 0
+        for channel_id in self.channel_ids:
+            channel = interaction.guild.get_channel(channel_id)
+            if channel is None:
+                continue
+            pair = match_views.is_private_match_room(channel)
+            try:
+                await channel.delete(reason=f"!ルーム一括削除（{interaction.user}）")
+                deleted += 1
+            except discord.HTTPException as error:
+                failed += 1
+                print(f"「{channel.name}」の削除に失敗しました：{error}")
+                continue
+            if remove_history and pair and len(pair) == 2:
+                match_store.unmark_matched(pair[0], pair[1])
+                try:
+                    if await asyncio.to_thread(match_records.remove_match, pair[0], pair[1]):
+                        history_removed += 1
+                except Exception as error:  # noqa: BLE001 - 1件失敗しても続ける
+                    print(f"マッチング履歴の削除に失敗しました：{error}")
+
+        message = f"✅ マッチングルームを {deleted} 件削除しました。"
+        if remove_history:
+            message += f"\n・マッチング履歴から {history_removed} 件削除しました（会員一覧ページで「申請可能」に戻ります）。"
+        if failed:
+            message += f"\n⚠️ {failed} 件は削除できませんでした（botの「チャンネルの管理」権限を確認してください）。"
+        await interaction.followup.send(message)
+
+    @discord.ui.button(label="ルームだけ削除", style=discord.ButtonStyle.danger)
+    async def delete_rooms(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run(interaction, remove_history=False)
+
+    @discord.ui.button(label="ルームとマッチング履歴を削除", style=discord.ButtonStyle.danger)
+    async def delete_rooms_and_history(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._run(interaction, remove_history=True)
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content=interaction.message.content + "\n\n取りやめました。", view=None)
+
+
+@bot.command(name="ルーム一括削除")
+@is_admin()
+async def bulk_delete_rooms(ctx: commands.Context, *, keyword: str):
+    """
+    マッチングルームのカテゴリにある、名前に keyword を含むチャンネルをまとめて削除する管理者向けコマンド。
+    例：!ルーム一括削除 冨樫惟新運営
+    まず対象の一覧を出し、ボタンを押したときだけ削除する。
+    「ルームとマッチング履歴を削除」を選ぶと、2人のマッチング記録も消す（会員一覧で「申請可能」に戻る）。
+    """
+    keyword = keyword.strip()
+    if not keyword:
+        await ctx.send("使い方：`!ルーム一括削除 冨樫惟新運営` のように、名前に含まれる文字を入れてください。")
+        return
+
+    targets = [
+        channel
+        for channel in ctx.guild.text_channels
+        if channel.category is not None
+        and match_views._is_match_category(channel.category)
+        and keyword in channel.name
+    ]
+    if not targets:
+        await ctx.send(f"マッチングルームのカテゴリに、名前に「{keyword}」を含むチャンネルは見つかりませんでした。")
+        return
+
+    listing = "\n".join(f"・{channel.name}" for channel in targets)
+    head = (
+        f"名前に「{keyword}」を含むマッチングルームが {len(targets)} 件あります。\n"
+        "削除したチャンネルは元に戻せません。内容を確認して、ボタンを押してください。"
+    )
+    view = RoomBulkDeleteView(ctx.author.id, [channel.id for channel in targets])
+    if len(head) + len(listing) > 1800:
+        await ctx.send(
+            head + "\n（一覧が長いのでファイルにしました）",
+            file=discord.File(io.BytesIO(listing.encode("utf-8")), filename="削除するルーム.txt"),
+            view=view,
+        )
+    else:
+        await ctx.send(f"{head}\n\n{listing}", view=view)
 
 
 @bot.command(name="チャンネル数")
