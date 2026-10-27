@@ -111,7 +111,7 @@ class MultiPrefecturePicker:
 
 
 class LocationCityModal(discord.ui.Modal):
-    """選んだ都道府県ごとに市町村を入力するフォーム（最大5つ）。①だけ必須。"""
+    """選んだ都道府県ごとに市町村を入力するフォーム（最大5つ）。すべて任意（空欄でもよい）。"""
 
     def __init__(self, prefecture_list: list[str], defaults: dict[str, str], on_done, title: str = "市町村を入力"):
         super().__init__(title=title)
@@ -121,9 +121,9 @@ class LocationCityModal(discord.ui.Modal):
         for i, pref in enumerate(prefecture_list[:MAX_LOCATIONS]):
             text_input = discord.ui.TextInput(
                 label=f"{_CIRCLED[i]} 市町村（{pref}）",
-                placeholder="例：札幌市" if i == 0 else "わかる範囲で（空欄でもOK）",
+                placeholder="例：札幌市（空欄でもOK）",
                 default=defaults.get(pref) or None,
-                required=(i == 0),
+                required=False,
                 max_length=50,
             )
             self.inputs.append(text_input)
