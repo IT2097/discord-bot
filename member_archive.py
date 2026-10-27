@@ -15,10 +15,12 @@
   A 番号                             → A
   B 名前（本名）                     → B
   L DiscordID                        → C（オプチャ/DiscordID）
-  年齢・性別・都道府県・市町村       → D・E・F・G
+  年齢・性別・都道府県①・市町村①   → D・E・F・G
   業種・事業 / 活動内容              → H・I
-  URL①・URL②・URL③                  → J・K・L
+  URL①・URL②・URL③                  → J・K・L（入力シートに列が無ければ空欄）
+  都道府県②・市町村② 〜 ⑤          → M〜T
 入力シートの列は見出し名で探すので、入力シートの列の順番が変わっても動く。
+URL・都道府県②〜⑤の列は、入力シートに無ければ空欄のまま移す。
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ _WRITE_SCOPES = [
 INPUT_SHEET_NAME = os.getenv("SHEET_NAME", "入力シート")
 WITHDRAWN_SHEET_NAME = os.getenv("WITHDRAWN_SHEET_NAME", "退会者")
 
-# 退会者シートに書き込む順番（入力シートの見出し名。None はA列の番号）
+# 退会者シートに書き込む順番（入力シートの見出し名）
 _COPY_HEADERS_AFTER_ID = [
     sheets_client.HEADER_AGE,
     sheets_client.HEADER_GENDER,
@@ -52,7 +54,15 @@ _COPY_HEADERS_AFTER_ID = [
     sheets_client.HEADER_URL_1,
     sheets_client.HEADER_URL_2,
     sheets_client.HEADER_URL_3,
+    *[header for pair in sheets_client.LOCATION_HEADERS[1:] for header in pair],
 ]
+# 入力シートに無くてもよい列（無ければ空欄で移す）
+_OPTIONAL_HEADERS = {
+    sheets_client.HEADER_URL_1,
+    sheets_client.HEADER_URL_2,
+    sheets_client.HEADER_URL_3,
+    *[header for pair in sheets_client.LOCATION_HEADERS[1:] for header in pair],
+}
 
 _RETRY_COUNT = 4
 _RETRY_WAIT_SECONDS = 20
@@ -143,7 +153,11 @@ def archive_member(discord_id: str) -> dict:
 
         header = values[0]
         name_col = _col_index(header, sheets_client.HEADER_NAME)
-        other_cols = [_col_index(header, h) for h in _COPY_HEADERS_AFTER_ID]
+        normalized_header = [str(h).strip() for h in header]
+        other_cols = [
+            None if (h in _OPTIONAL_HEADERS and h not in normalized_header) else _col_index(header, h)
+            for h in _COPY_HEADERS_AFTER_ID
+        ]
         name = _cell(values[target_indices[0]], name_col)
 
         new_rows = []
@@ -155,7 +169,7 @@ def archive_member(discord_id: str) -> dict:
                     _cell(row, name_col),
                     # 先頭の ' で文字として扱わせる（長い数字が 9.7E+17 のように桁落ちするのを防ぐ）
                     f"'{discord_id}",
-                    *[_cell(row, c) for c in other_cols],
+                    *[_cell(row, c) if c is not None else "" for c in other_cols],
                 ]
             )
 

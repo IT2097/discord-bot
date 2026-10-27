@@ -21,9 +21,11 @@ PREFECTURES = [
 ]
 
 # プルダウン2つに分ける（どちらも25個以内）
+#   東日本：北海道・東北・関東・甲信越・北陸・東海（24）
+#   西日本：近畿・中国・四国・九州・沖縄（23）
 PREFECTURE_GROUPS = [
-    ("都道府県を選択（北海道〜三重県）", PREFECTURES[:24]),
-    ("都道府県を選択（滋賀県〜沖縄県）", PREFECTURES[24:]),
+    ("東日本（北海道〜三重県）", PREFECTURES[:24]),
+    ("西日本（滋賀県〜沖縄県）", PREFECTURES[24:]),
 ]
 
 # 「大阪」→「大阪府」のように、末尾の都・道・府・県を省いた書き方からの対応表
@@ -31,7 +33,6 @@ _SHORT_NAMES = {}
 for _pref in PREFECTURES:
     if _pref == "北海道":
         _SHORT_NAMES["北海道"] = _pref
-        _SHORT_NAMES["北海"] = _pref
     else:
         _SHORT_NAMES[_pref[:-1]] = _pref
 
@@ -48,3 +49,42 @@ def normalize_prefecture(text: str) -> str | None:
     if value in PREFECTURES:
         return value
     return _SHORT_NAMES.get(value)
+
+
+_SEPARATORS = "、,，・/／ 　\n"
+
+
+def split_prefectures(text: str) -> list[str] | None:
+    """
+    1つのセルに複数の都道府県が入っているとき、正式名称のリストに分ける。
+    「大阪府、東京都」「大阪・東京」「大阪府 東京都」「大阪東京」→ ["大阪府", "東京都"]
+    1つでも都道府県だと判断できない部分があれば None を返す（手で直してもらう）。
+    """
+    value = unicodedata.normalize("NFKC", str(text or "")).strip()
+    for sep in _SEPARATORS:
+        value = value.replace(sep, "\0")
+    tokens = [t for t in value.split("\0") if t]
+    if not tokens:
+        return []
+
+    names = sorted(set(PREFECTURES) | set(_SHORT_NAMES), key=len, reverse=True)
+    result: list[str] = []
+    for token in tokens:
+        rest = token
+        while rest:
+            match = next((n for n in names if rest.startswith(n)), None)
+            if match is None:
+                return None
+            fixed = match if match in PREFECTURES else _SHORT_NAMES[match]
+            rest = rest[len(match):]
+            if fixed not in result:
+                result.append(fixed)
+    return result
+
+
+def split_cities(text: str) -> list[str]:
+    """市町村のセルを区切り文字で分ける（都道府県が複数あるときの対応付け用）。"""
+    value = unicodedata.normalize("NFKC", str(text or "")).strip()
+    for sep in "、,，・/／\n":
+        value = value.replace(sep, "\0")
+    return [t.strip() for t in value.split("\0") if t.strip()]

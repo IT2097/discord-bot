@@ -3,17 +3,19 @@ Googleスプレッドシートから会員一覧を読み込むモジュール�
 
 【前提とするスプレッドシートの形式】
 1行目をヘッダー行として、以下の列名を想定しています（列の順番は自由）。
-  - DiscordID   : 会員のDiscordユーザーID（数字のみ。開発者モードでコピーしたID）
-  - 名前（本名） : Webページ上に表示する名前
-  - 年齢・性別・都道府県・市町村・業種・事業 / 活動内容 : 一覧に表示する属性情報
+  - DiscordID          : 会員のDiscordユーザーID
+  - 名前（本名）        : Webページ上に表示する名前
+  - 年齢・性別          : 一覧に表示する属性情報
+  - 都道府県①・市町村① 〜 都道府県⑤・市町村⑤ : 活動地域（最大5か所。①が主な地域）
+  - 業種・事業 / 活動内容 : 1行に1件
+  - URL①〜③（任意。列が無くても動く）
 
 ヘッダー名が違う場合は下の HEADER_* 定数を書き換えてください。
 
 【1人が複数行にまたがるシートへの対応】
-「事業/活動内容ごとに行が分かれていて、同じ人が複数行に登場する」形式のシート
-（例: 渡辺大智さんが4行に分かれている等）に対応しています。
-DiscordIDは同じ人のどれか1行にだけ入力すればOKで、「名前（本名）」が同じ行は
-自動的に1人分としてまとめられ、業種・事業/活動内容はまとめて一覧で保持されます。
+「業種・事業内容ごとに行が分かれていて、同じ人が複数行に登場する」形式に対応しています。
+「名前（本名）」が同じ行は1人分としてまとめ、業種・事業内容は一覧で保持します。
+都道府県①〜⑤・市町村①〜⑤は、同じ人のどの行にも同じ値が入っている想定で、最初の行から読みます。
 """
 
 from __future__ import annotations
@@ -30,34 +32,34 @@ HEADER_DISCORD_ID = "DiscordID"
 HEADER_NAME = "名前（本名）"
 HEADER_AGE = "年齢"
 HEADER_GENDER = "性別"
-HEADER_PREFECTURE = "都道府県"
-HEADER_CITY = "市町村"
 HEADER_BUSINESS_TYPE = "業種"
 HEADER_BUSINESS_CONTENT = "事業 / 活動内容"
 HEADER_URL_1 = "URL①"
 HEADER_URL_2 = "URL②"
 HEADER_URL_3 = "URL③"
+
+# 活動地域（都道府県と市町村のセット）。①が主な地域
+MAX_LOCATIONS = 5
+_CIRCLED = "①②③④⑤"
+LOCATION_HEADERS = [(f"都道府県{_CIRCLED[i]}", f"市町村{_CIRCLED[i]}") for i in range(MAX_LOCATIONS)]
+# 以前の1か所だけの列名（「都道府県」「市町村」）を使っているシートにも対応する
+_LEGACY_LOCATION_HEADERS = ("都道府県", "市町村")
+HEADER_PREFECTURE, HEADER_CITY = LOCATION_HEADERS[0]
+
 CACHE_SECONDS = 300  # スプレッドシートを毎回読みに行かず、5分間だけ結果をキャッシュする
 
 # 業種のプルダウン選択肢を読み込む「設定用」シートの名前・見出し名
 BUSINESS_TYPE_SETTINGS_SHEET_NAME = os.getenv("BUSINESS_TYPE_SETTINGS_SHEET_NAME", "設定用")
 BUSINESS_TYPE_SETTINGS_HEADER = os.getenv("BUSINESS_TYPE_SETTINGS_HEADER", "業種1")
 
-# get_all_records() に明示的に渡す想定ヘッダー。
-# これを渡すことで、他の列の見出しが空欄・重複していてもエラーにならない
-# （逆にここに書いた列の見出しは、スプレッドシート上で必ず一致させる必要がある）。
-_EXPECTED_HEADERS = [
+# 必ず必要な列（無いとエラー）。URLや都道府県②〜⑤は無くても動く
+_REQUIRED_HEADERS = [
     HEADER_DISCORD_ID,
     HEADER_NAME,
     HEADER_AGE,
     HEADER_GENDER,
-    HEADER_PREFECTURE,
-    HEADER_CITY,
     HEADER_BUSINESS_TYPE,
     HEADER_BUSINESS_CONTENT,
-    HEADER_URL_1,
-    HEADER_URL_2,
-    HEADER_URL_3,
 ]
 
 _SCOPES = [
@@ -73,22 +75,44 @@ _business_type_cache = {"data": None, "fetched_at": 0.0}
 def _get_client():
     """
     サービスアカウントの認証情報から gspread クライアントを作成する。
-
-    環境変数 GOOGLE_SERVICE_ACCOUNT_JSON に、サービスアカウントのJSONキーの
-    中身をそのまま（1行の文字列として）設定しておく想定です。
+    環境変数 GOOGLE_SERVICE_ACCOUNT_JSON に、サービスアカウントのJSONキーの中身をそのまま入れておく。
     """
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw_json:
-        raise RuntimeError(
-            "環境変数 GOOGLE_SERVICE_ACCOUNT_JSON が設定されていません。"
-        )
+        raise RuntimeError("環境変数 GOOGLE_SERVICE_ACCOUNT_JSON が設定されていません。")
 
     import json
 
-    # strict=False: 環境変数への貼り付け時に生の改行が混入していても許容する
     info = json.loads(raw_json, strict=False)
     creds = Credentials.from_service_account_info(info, scopes=_SCOPES)
     return gspread.authorize(creds)
+
+
+def location_columns(headers: list[str]) -> list[tuple[int | None, int | None]]:
+    """
+    見出し行から、都道府県①〜⑤・市町村①〜⑤の列番号（0始まり。無ければ None）を返す。
+    ①が無いシートでは、以前の「都道府県」「市町村」の列を①として扱う。
+    """
+    normalized = [str(h).strip() for h in headers]
+
+    def find(name):
+        return normalized.index(name) if name in normalized else None
+
+    columns = [(find(p), find(c)) for p, c in LOCATION_HEADERS]
+    if columns[0] == (None, None):
+        columns[0] = (find(_LEGACY_LOCATION_HEADERS[0]), find(_LEGACY_LOCATION_HEADERS[1]))
+    return columns
+
+
+def read_locations(row: list[str], columns) -> list[dict]:
+    """1行から、入っている活動地域だけを順番どおりに取り出す。"""
+    locations = []
+    for pref_col, city_col in columns:
+        pref = str(row[pref_col]).strip() if pref_col is not None and pref_col < len(row) else ""
+        city = str(row[city_col]).strip() if city_col is not None and city_col < len(row) else ""
+        if pref or city:
+            locations.append({"prefecture": pref, "city": city})
+    return locations
 
 
 def _fetch_members_from_sheet():
@@ -100,58 +124,73 @@ def _fetch_members_from_sheet():
 
     client = _get_client()
     sheet = client.open_by_key(spreadsheet_id).worksheet(sheet_name)
-    # expected_headers を渡すことで、他の列の見出しが空欄・重複していても
-    # エラーにならないようにする（1行目をヘッダーとして辞書のリストを取得）
-    rows = sheet.get_all_records(expected_headers=_EXPECTED_HEADERS)
+    values = sheet.get_all_values()
+    if not values:
+        return []
+
+    headers = [str(h).strip() for h in values[0]]
+    missing = [h for h in _REQUIRED_HEADERS if h not in headers]
+    if missing:
+        raise RuntimeError(f"「{sheet_name}」シートの1行目に、次の見出しが見つかりません：{'、'.join(missing)}")
+
+    col = {h: headers.index(h) for h in headers if h}
+    loc_columns = location_columns(headers)
+
+    def cell(row, header):
+        index = col.get(header)
+        return str(row[index]).strip() if index is not None and index < len(row) else ""
 
     # 「名前（本名）」をキーに、複数行にまたがる情報を1人分にまとめる。
-    # DiscordIDは同じ人のどこか1行にだけ入っていればよいので、
-    # 先に名前でグルーピングしてから、最後にDiscordIDが無い人だけ除外する。
     members_by_name: dict[str, dict] = {}
 
-    for row in rows:
-        name = str(row.get(HEADER_NAME, "")).strip()
+    for row in values[1:]:
+        name = cell(row, HEADER_NAME)
         if not name:
-            continue  # 名前が空の行（見出しだけの行など）はスキップ
+            continue  # 名前が空の行はスキップ
 
         entry = members_by_name.get(name)
         if entry is None:
+            locations = read_locations(row, loc_columns)
+            first = locations[0] if locations else {"prefecture": "", "city": ""}
             entry = {
                 "name": name,
                 "discord_id": "",
-                "age": str(row.get(HEADER_AGE, "")).strip(),
-                "gender": str(row.get(HEADER_GENDER, "")).strip(),
-                "prefecture": str(row.get(HEADER_PREFECTURE, "")).strip(),
-                "city": str(row.get(HEADER_CITY, "")).strip(),
+                "age": cell(row, HEADER_AGE),
+                "gender": cell(row, HEADER_GENDER),
+                # 以前からの呼び方（主な地域＝①）も残しておく
+                "prefecture": first["prefecture"],
+                "city": first["city"],
+                "locations": locations,
                 "businesses": [],
                 "urls": [],
             }
             members_by_name[name] = entry
 
-        discord_id = str(row.get(HEADER_DISCORD_ID, "")).strip()
+        discord_id = cell(row, HEADER_DISCORD_ID).lstrip("'")
         if discord_id and not entry["discord_id"]:
             entry["discord_id"] = discord_id
 
-        business_type = str(row.get(HEADER_BUSINESS_TYPE, "")).strip()
-        business_content = str(row.get(HEADER_BUSINESS_CONTENT, "")).strip()
+        business_type = cell(row, HEADER_BUSINESS_TYPE)
+        business_content = cell(row, HEADER_BUSINESS_CONTENT)
         if business_type or business_content:
             entry["businesses"].append({"type": business_type, "content": business_content})
 
         for header in (HEADER_URL_1, HEADER_URL_2, HEADER_URL_3):
-            url = str(row.get(header, "")).strip()
+            url = cell(row, header)
             if url and url not in entry["urls"]:
                 entry["urls"].append(url)
 
     # DiscordIDが1行も見つからなかった人は、Discordと紐付けできないため一覧から除外する
-    members = [entry for entry in members_by_name.values() if entry["discord_id"]]
+    return [entry for entry in members_by_name.values() if entry["discord_id"]]
 
-    return members
+
+def format_locations(locations: list[dict], separator: str = "、") -> str:
+    """活動地域を「北海道札幌市、東京都港区」のような1行の文字にする。"""
+    return separator.join(f"{loc['prefecture']}{loc['city']}" for loc in locations if loc["prefecture"] or loc["city"])
 
 
 def get_members(force_refresh: bool = False):
-    """
-    会員一覧を返す。CACHE_SECONDS以内の再取得はキャッシュを返す。
-    """
+    """会員一覧を返す。CACHE_SECONDS以内の再取得はキャッシュを返す。"""
     with _lock:
         now = time.time()
         is_stale = (now - _cache["fetched_at"]) > CACHE_SECONDS
@@ -173,9 +212,8 @@ def find_member_name(discord_id: str) -> str | None:
 
 def find_member(discord_id: str, force_refresh: bool = False) -> dict | None:
     """
-    DiscordIDからプロフィール全体（名前・年齢・性別・都道府県・市町村・業種等）を引く。
-    force_refresh=True で、キャッシュを無視して最新の内容を取得する
-    （名前登録直後など、すぐに反映を確認したい場合に使う）。
+    DiscordIDからプロフィール全体（名前・年齢・性別・活動地域・業種等）を引く。
+    force_refresh=True で、キャッシュを無視して最新の内容を取得する。
     """
     for member in get_members(force_refresh=force_refresh):
         if member["discord_id"] == str(discord_id):
@@ -201,7 +239,7 @@ def _fetch_business_type_options() -> list[str]:
     import unicodedata
 
     def _norm(text: str) -> str:
-        # 全角/半角（「業種１」と「業種1」など）や前後・途中の空白の違いを吸収して比較する
+        # 全角/半角（「業種１」と「業種1」など）や空白の違いを吸収して比較する
         return "".join(unicodedata.normalize("NFKC", str(text)).split())
 
     header_row = sheet.row_values(1)
@@ -222,10 +260,7 @@ def _fetch_business_type_options() -> list[str]:
 
 
 def get_business_type_options(force_refresh: bool = False) -> list[str]:
-    """
-    「設定用」シートの「業種1」列から、業種のプルダウン選択肢を取得する
-    （短時間キャッシュ付き）。
-    """
+    """「設定用」シートの「業種1」列から、業種のプルダウン選択肢を取得する（短時間キャッシュ付き）。"""
     with _lock:
         now = time.time()
         is_stale = (now - _business_type_cache["fetched_at"]) > CACHE_SECONDS

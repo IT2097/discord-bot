@@ -56,6 +56,98 @@ def mark_defaults(select: discord.ui.Select, selected: str | None):
         option.default = option.value == selected
 
 
+MAX_LOCATIONS = profile_sheet.MAX_LOCATIONS
+_CIRCLED = "①②③④⑤"
+
+
+class MultiPrefecturePicker:
+    """
+    都道府県を複数（最大5つ）選ぶための、東日本・西日本の2つのプルダウン。
+    選んだ順番を覚えておき、最初に選んだものを①（主な地域）にする。
+    on_change(interaction) は、選択が変わるたびに呼ばれる（画面の書き直し用）。
+    """
+
+    def __init__(self, selected: list[str], on_change):
+        self.selected: list[str] = [p for p in selected if p in prefectures.PREFECTURES]
+        self.on_change = on_change
+        self.selects: list[discord.ui.Select] = []
+        for placeholder, names in prefectures.PREFECTURE_GROUPS:
+            select = discord.ui.Select(
+                placeholder=f"{placeholder}から選ぶ（複数選べます）",
+                options=[discord.SelectOption(label=name) for name in names],
+                min_values=0,
+                max_values=min(MAX_LOCATIONS, len(names)),
+            )
+
+            async def callback(interaction: discord.Interaction, _select=select, _names=names):
+                chosen = list(_select.values)
+                # このプルダウンの分だけ入れ替える（もう片方で選んだものと、選んだ順番はそのまま）
+                kept = [p for p in self.selected if p not in _names or p in chosen]
+                self.selected = kept + [p for p in chosen if p not in kept]
+                self.mark()
+                await self.on_change(interaction)
+
+            select.callback = callback
+            self.selects.append(select)
+        self.mark()
+
+    def mark(self):
+        for select in self.selects:
+            for option in select.options:
+                option.default = option.value in self.selected
+
+    def summary(self) -> str:
+        if not self.selected:
+            return "（未選択）"
+        return "　".join(f"{_CIRCLED[i] if i < len(_CIRCLED) else '・'}{p}" for i, p in enumerate(self.selected))
+
+    def problem(self) -> str | None:
+        """「次へ」を押せない理由（問題なければ None）。"""
+        if not self.selected:
+            return "都道府県を1つ以上選んでください。"
+        if len(self.selected) > MAX_LOCATIONS:
+            return f"都道府県は{MAX_LOCATIONS}つまでです。いま{len(self.selected)}つ選ばれているので、減らしてください。"
+        return None
+
+
+class LocationCityModal(discord.ui.Modal):
+    """選んだ都道府県ごとに市町村を入力するフォーム（最大5つ）。①だけ必須。"""
+
+    def __init__(self, prefecture_list: list[str], defaults: dict[str, str], on_done, title: str = "市町村を入力"):
+        super().__init__(title=title)
+        self.prefecture_list = prefecture_list
+        self.on_done = on_done
+        self.inputs: list[discord.ui.TextInput] = []
+        for i, pref in enumerate(prefecture_list[:MAX_LOCATIONS]):
+            text_input = discord.ui.TextInput(
+                label=f"{_CIRCLED[i]} 市町村（{pref}）",
+                placeholder="例：札幌市" if i == 0 else "わかる範囲で（空欄でもOK）",
+                default=defaults.get(pref) or None,
+                required=(i == 0),
+                max_length=50,
+            )
+            self.inputs.append(text_input)
+            self.add_item(text_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        locations = [
+            {"prefecture": pref, "city": text_input.value.strip()}
+            for pref, text_input in zip(self.prefecture_list, self.inputs)
+        ]
+        await self.on_done(interaction, locations)
+
+    async def on_error(self, interaction, error):
+        await _report_error(interaction, error)
+
+
+def locations_text(locations: list[dict]) -> str:
+    if not locations:
+        return "（未入力）"
+    return "　".join(
+        f"{_CIRCLED[i] if i < len(_CIRCLED) else '・'}{loc['prefecture']}{loc['city']}" for i, loc in enumerate(locations)
+    )
+
+
 def _business_type_select(options: list[str], current: str | None) -> discord.ui.Select:
     """業種のプルダウン（「設定用」シートの選択肢。今の業種が一覧に無ければ先頭に足す）。"""
     names = list(dict.fromkeys(o[:100] for o in options if o.strip()))
@@ -71,7 +163,7 @@ def _business_type_select(options: list[str], current: str | None) -> discord.ui
 
 
 def _profile_text(profile: dict, notice: str = "") -> str:
-    location = f"{profile['prefecture']}{profile['city']}" or "（未入力）"
+    location = locations_text(profile.get("locations", []))
     if profile["businesses"]:
         businesses = "\n".join(
             f"　{i + 1}. 【{b['type'] or '業種なし'}】{b['content']}" for i, b in enumerate(profile["businesses"])
@@ -352,55 +444,50 @@ class LocationEditView(_BaseView):
     def __init__(self, menu: ProfileEditMenu):
         super().__init__(menu.member_id)
         self.menu = menu
-        self.prefecture = prefectures.normalize_prefecture(menu.profile["prefecture"])
-        self.pref_selects = build_prefecture_selects(self.prefecture, self.on_prefecture)
-        for i, select in enumerate(self.pref_selects):
+        current = [prefectures.normalize_prefecture(loc["prefecture"]) for loc in menu.profile.get("locations", [])]
+        self.picker = MultiPrefecturePicker([p for p in current if p], self.on_change)
+        for i, select in enumerate(self.picker.selects):
             select.row = i
             self.add_item(select)
         self.add_item(_BackButton(menu, row=2))
 
     def text(self) -> str:
-        current = self.prefecture or "（未選択）"
         return (
-            "都道府県を、どちらかのプルダウンから選んでください。\n"
+            f"活動している都道府県を、東日本・西日本のプルダウンから選んでください（{MAX_LOCATIONS}つまで）。\n"
+            "最初に選んだものが①（主な地域）になります。選び直すと順番が変わることがあります。\n"
             "選んだら「次へ（市町村を入力）」を押してください。\n\n"
-            f"選択中：**{current}**"
+            f"選択中：**{self.picker.summary()}**"
         )
 
-    async def on_prefecture(self, interaction: discord.Interaction, value: str):
-        self.prefecture = value
-        for select in self.pref_selects:
-            mark_defaults(select, value)
+    async def on_change(self, interaction: discord.Interaction):
         await interaction.response.edit_message(content=self.text(), view=self)
 
     @discord.ui.button(label="次へ（市町村を入力）", style=discord.ButtonStyle.primary, row=2)
     async def next_step(self, interaction: discord.Interaction, button):
-        if not self.prefecture:
-            await interaction.response.send_message("先に都道府県を選んでください。", ephemeral=True)
+        problem = self.picker.problem()
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
             return
-        await interaction.response.send_modal(CityModal(self))
-
-
-class CityModal(_BaseModal, title="市町村を入力"):
-    def __init__(self, parent: LocationEditView):
-        super().__init__()
-        self.parent = parent
-        self.city_input = discord.ui.TextInput(
-            label=f"市町村（{parent.prefecture}）",
-            placeholder="例：大阪市北区",
-            default=parent.menu.profile["city"] or None,
-            max_length=50,
+        defaults = {}
+        for loc in self.menu.profile.get("locations", []):
+            pref = prefectures.normalize_prefecture(loc["prefecture"])
+            if pref and loc["city"]:
+                defaults.setdefault(pref, loc["city"])
+        await interaction.response.send_modal(
+            LocationCityModal(self.picker.selected, defaults, self.save)
         )
-        self.add_item(self.city_input)
 
-    async def on_submit(self, interaction: discord.Interaction):
+    async def save(self, interaction: discord.Interaction, locations: list[dict]):
         await interaction.response.defer()
-        diffs = await asyncio.to_thread(
-            profile_sheet.update_fields,
-            str(interaction.user.id),
-            {"prefecture": self.parent.prefecture, "city": self.city_input.value.strip()},
-        )
-        await _after_field_update(interaction, self.parent.menu, diffs)
+        result = await asyncio.to_thread(profile_sheet.update_locations, str(interaction.user.id), locations)
+        if result is None:
+            await show_menu(interaction, "変更はありませんでした。", self.menu.options)
+            return
+        before, after = result
+        line = f"地域：{locations_text(before)} → {locations_text(after)}"
+        await _log(interaction, self.menu.profile["name"], [line])
+        await _refresh_cache()
+        await show_menu(interaction, "✅ 保存しました\n" + line, self.menu.options)
 
 
 # --- 業種と事業内容 -----------------------------------------------------------

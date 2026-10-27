@@ -31,7 +31,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-26 ルーム一括削除版"
+BOT_VERSION = "2026-10-27 地域5つ対応版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -973,8 +973,7 @@ class ProfileBasicsView(discord.ui.View):
     """
     新規会員のプロフィール入力（1/3）。年齢・性別・都道府県をプルダウンで選んでもらい、
     「次へ」で市町村の入力フォーム（2/3）に進む。
-    都道府県は47個あり、Discordのプルダウンは25個までなので、2つに分けて表示する
-    （「大阪」「大阪府」のような表記ゆれが出ないよう、自由入力はやめた）。
+    都道府県は東日本・西日本の2つのプルダウンから、5つまで選べる（最初に選んだものが①＝主な地域）。
     """
 
     def __init__(self, member_id: int, name: str, business_type_options: list[str]):
@@ -984,7 +983,6 @@ class ProfileBasicsView(discord.ui.View):
         self.business_type_options = business_type_options
         self.selected_age: str | None = None
         self.selected_gender: str | None = None
-        self.selected_prefecture: str | None = None
 
         self.age_select = discord.ui.Select(
             placeholder="年齢を選択",
@@ -1001,18 +999,19 @@ class ProfileBasicsView(discord.ui.View):
         self.add_item(self.age_select)
         self.add_item(self.gender_select)
 
-        self.pref_selects = profile_edit.build_prefecture_selects(None, self._on_prefecture)
-        for row, select in enumerate(self.pref_selects, start=2):
+        self.picker = profile_edit.MultiPrefecturePicker([], self._on_prefecture)
+        for row, select in enumerate(self.picker.selects, start=2):
             select.row = row
             self.add_item(select)
 
     def summary_text(self) -> str:
         return (
             "会員情報が見つからなかったため、続けてプロフィールを入力してください。\n"
-            "年齢・性別・都道府県を選んで「次へ」を押してください"
-            "（都道府県は、どちらかのプルダウンから選んでください）。\n\n"
-            f"年齢：{self.selected_age or '未選択'}　性別：{self.selected_gender or '未選択'}　"
-            f"都道府県：{self.selected_prefecture or '未選択'}"
+            "年齢・性別と、活動している都道府県を選んで「次へ」を押してください。\n"
+            f"都道府県は東日本・西日本のプルダウンから{profile_edit.MAX_LOCATIONS}つまで選べます"
+            "（最初に選んだものが①＝主な地域になります）。\n\n"
+            f"年齢：{self.selected_age or '未選択'}　性別：{self.selected_gender or '未選択'}\n"
+            f"都道府県：{self.picker.summary()}"
         )
 
     async def _check_owner(self, interaction: discord.Interaction) -> bool:
@@ -1027,8 +1026,7 @@ class ProfileBasicsView(discord.ui.View):
         # 選んだものに印を付け直してから表示し直す（表示し直すと選択が消えて見えるのを防ぐ）
         profile_edit.mark_defaults(self.age_select, self.selected_age)
         profile_edit.mark_defaults(self.gender_select, self.selected_gender)
-        for select in self.pref_selects:
-            profile_edit.mark_defaults(select, self.selected_prefecture)
+        self.picker.mark()
         await interaction.response.edit_message(content=self.summary_text(), view=self)
 
     async def _on_age(self, interaction: discord.Interaction):
@@ -1043,10 +1041,9 @@ class ProfileBasicsView(discord.ui.View):
         self.selected_gender = self.gender_select.values[0]
         await self._refresh(interaction)
 
-    async def _on_prefecture(self, interaction: discord.Interaction, value: str):
+    async def _on_prefecture(self, interaction: discord.Interaction):
         if not await self._check_owner(interaction):
             return
-        self.selected_prefecture = value
         await self._refresh(interaction)
 
     @discord.ui.button(label="次へ", style=discord.ButtonStyle.primary, row=4)
@@ -1054,66 +1051,36 @@ class ProfileBasicsView(discord.ui.View):
         if not await self._check_owner(interaction):
             return
 
-        if not self.selected_age or not self.selected_gender or not self.selected_prefecture:
+        if not self.selected_age or not self.selected_gender:
             await interaction.response.send_message(
-                "年齢・性別・都道府県をすべて選択してから「次へ」を押してください。", ephemeral=True
+                "年齢と性別を選択してから「次へ」を押してください。", ephemeral=True
             )
             return
+        problem = self.picker.problem()
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return
 
-        await interaction.response.send_modal(
-            ProfileLocationModal(
+        async def on_done(modal_interaction: discord.Interaction, locations: list[dict]):
+            base_profile = {
+                "name": self.name,
+                "discord_id": str(self.member_id),
+                "age": self.selected_age,
+                "gender": self.selected_gender,
+                "locations": locations,
+            }
+            view = BusinessEntryView(
                 member_id=self.member_id,
-                name=self.name,
-                age=self.selected_age,
-                gender=self.selected_gender,
-                prefecture=self.selected_prefecture,
+                base_profile=base_profile,
                 business_type_options=self.business_type_options,
             )
+            await modal_interaction.response.edit_message(content=view.summary_text(), view=view)
+
+        await interaction.response.send_modal(
+            profile_edit.LocationCityModal(
+                list(self.picker.selected), {}, on_done, title="プロフィール入力（続き）"
+            )
         )
-
-
-class ProfileLocationModal(discord.ui.Modal, title="プロフィール入力（続き）"):
-    """
-    新規会員のプロフィール入力（2/3）。市町村を入力してもらい、
-    続けて業種・事業内容を入力するフォーム（3/3）に進む（都道府県は1/3のプルダウンで選択済み）。
-    """
-
-    city = discord.ui.TextInput(label="市町村", placeholder="例：札幌市", max_length=20)
-
-    def __init__(
-        self,
-        member_id: int,
-        name: str,
-        age: str,
-        gender: str,
-        prefecture: str,
-        business_type_options: list[str],
-    ):
-        super().__init__()
-        self.member_id = member_id
-        self.name = name
-        self.age = age
-        self.gender = gender
-        self.prefecture = prefecture
-        self.business_type_options = business_type_options
-        self.city.label = f"市町村（{prefecture}）"
-
-    async def on_submit(self, interaction: discord.Interaction):
-        base_profile = {
-            "name": self.name,
-            "discord_id": str(self.member_id),
-            "age": self.age,
-            "gender": self.gender,
-            "prefecture": self.prefecture,
-            "city": self.city.value.strip(),
-        }
-
-        view = BusinessEntryView(
-            member_id=self.member_id,
-            base_profile=base_profile,
-            business_type_options=self.business_type_options,
-        )
-        await interaction.response.edit_message(content=view.summary_text(), view=view)
 
 
 class BusinessEntryView(discord.ui.View):
@@ -1203,7 +1170,7 @@ class BusinessEntryView(discord.ui.View):
 
         try:
             await asyncio.to_thread(
-                sheet_sync.append_new_member_rows, self.base_profile, self.businesses
+                profile_sheet.append_new_member_rows, self.base_profile, self.businesses
             )
         except Exception as error:  # noqa: BLE001 - 本人にそのままエラー内容を見せる
             await interaction.edit_original_response(
@@ -1311,7 +1278,7 @@ async def _view_on_error(self, interaction: discord.Interaction, error: Exceptio
     await _report_interaction_error(interaction, error)
 
 
-for _modal_cls in (NameModal, ProfileLocationModal, BusinessPairModal):
+for _modal_cls in (NameModal, BusinessPairModal):
     _modal_cls.on_error = _modal_on_error
 for _view_cls in (ProfileBasicsView, BusinessEntryView, NameRegisterView):
     _view_cls.on_error = _view_on_error
@@ -1413,7 +1380,7 @@ async def unify_prefectures(ctx: commands.Context):
 
     # 同じ人・同じ変更は1行にまとめて見やすくする
     summary: dict[tuple[str, str, str], int] = {}
-    for _row, name, current, fixed in changes:
+    for _row, name, current, fixed, *_ in changes:
         summary[(name, current, fixed)] = summary.get((name, current, fixed), 0) + 1
     unresolved_summary: dict[tuple[str, str], list[int]] = {}
     for row, name, current in unresolved:

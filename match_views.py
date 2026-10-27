@@ -74,6 +74,20 @@ def is_private_match_room(channel: discord.TextChannel) -> list[str] | None:
     return None
 
 
+def _location_lines(member: dict) -> list[str]:
+    """活動地域の行。1か所なら「地域：北海道札幌市」、複数なら1か所ずつ番号を付けて並べる。"""
+    locations = member.get("locations") or (
+        [{"prefecture": member.get("prefecture", ""), "city": member.get("city", "")}]
+        if member.get("prefecture") or member.get("city")
+        else []
+    )
+    if not locations:
+        return []
+    if len(locations) == 1:
+        return [f"地域：{locations[0]['prefecture']}{locations[0]['city']}"]
+    return ["地域："] + [f"　{i + 1}. {loc['prefecture']}{loc['city']}" for i, loc in enumerate(locations)]
+
+
 def _format_profile(member: dict) -> str:
     """
     スプレッドシートのプロフィール情報（名前・年齢・性別・都道府県・市町村・
@@ -86,10 +100,7 @@ def _format_profile(member: dict) -> str:
         lines.append(f"年齢：{member['age']}")
     if member.get("gender"):
         lines.append(f"性別：{member['gender']}")
-    if member.get("prefecture"):
-        lines.append(f"都道府県：{member['prefecture']}")
-    if member.get("city"):
-        lines.append(f"市町村：{member['city']}")
+    lines.extend(_location_lines(member))
 
     for biz in member.get("businesses", []):
         biz_type = biz.get("type", "")
@@ -114,10 +125,7 @@ def _format_full_profile(member: dict) -> str:
         lines.append(f"年齢：{member['age']}")
     if member.get("gender"):
         lines.append(f"性別：{member['gender']}")
-    if member.get("prefecture"):
-        lines.append(f"都道府県：{member['prefecture']}")
-    if member.get("city"):
-        lines.append(f"市町村：{member['city']}")
+    lines.extend(_location_lines(member))
 
     for biz in member.get("businesses", []):
         biz_type = biz.get("type", "")

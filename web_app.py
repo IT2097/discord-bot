@@ -102,7 +102,15 @@ def create_app(bot, run_coro):
                 f"{biz.get('type', '')} {biz.get('content', '')}"
                 for biz in member.get("businesses", [])
             )
-            member["search_blob"] = f"{member['name']} {business_text}".strip().lower()
+            location_text = " ".join(
+                f"{loc['prefecture']} {loc['city']}" for loc in member.get("locations", [])
+            )
+            member["search_blob"] = f"{member['name']} {business_text} {location_text}".strip().lower()
+            # 絞り込み用：活動地域の都道府県すべて（| 区切り）と、カードに出す地域の文字
+            member["prefecture_list"] = [
+                loc["prefecture"] for loc in member.get("locations", []) if loc.get("prefecture")
+            ]
+            member["location_text"] = sheets_client.format_locations(member.get("locations", []))
 
         # Discordで設定しているアイコン画像のURLを付ける（未設定・サーバーにいない人は名前の1文字目を表示）
         try:
@@ -116,7 +124,7 @@ def create_app(bot, run_coro):
         genders = sorted({m["gender"] for m in other_members if m.get("gender")})
         # 都道府県は北から順（北海道→沖縄）に並べる。一覧にない書き方（「札幌」など）は最後に回す
         prefectures = sorted(
-            {m["prefecture"] for m in other_members if m.get("prefecture")},
+            {p for m in other_members for p in m.get("prefecture_list", [])},
             key=_prefecture_sort_key,
         )
 

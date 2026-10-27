@@ -7,10 +7,12 @@ Discordの「プロフィール編集」から、スプレッドシート（入�
 - A列の番号は、業種を追加したときに上の行からコピーする
 
 【このモジュールでできること】
-- 名前・年齢・性別・都道府県・市町村の変更（その人の全部の行をまとめて書き換える）
+- 名前・年齢・性別の変更（その人の全部の行をまとめて書き換える）
+- 活動地域（都道府県①・市町村① 〜 都道府県⑤・市町村⑤）の変更（全部の行をまとめて書き換える）
+- 新規会員の行の追加（名前登録のプロフィール入力から）
 - 業種と事業内容の追加（その人の最後の行のすぐ下に1行入れる）
 - 業種と事業内容の修正・削除（削除で最後の1件にはできない。DiscordIDの入った行を消すときは、IDを残る行へ移す）
-- 都道府県の表記ゆれの一括統一（管理者コマンド用）
+- 都道府県の表記ゆれの一括統一・1つのセルに複数入っている都道府県の②〜⑤への振り分け（管理者コマンド用）
 
 書き込みの直前に必ずシートを読み直し、行がずれていないかを確かめてから書き込む。
 """
@@ -38,10 +40,9 @@ FIELD_HEADERS = {
     "name": sheets_client.HEADER_NAME,
     "age": sheets_client.HEADER_AGE,
     "gender": sheets_client.HEADER_GENDER,
-    "prefecture": sheets_client.HEADER_PREFECTURE,
-    "city": sheets_client.HEADER_CITY,
 }
-FIELD_LABELS = {"name": "名前", "age": "年齢", "gender": "性別", "prefecture": "都道府県", "city": "市町村"}
+FIELD_LABELS = {"name": "名前", "age": "年齢", "gender": "性別", "locations": "地域"}
+MAX_LOCATIONS = sheets_client.MAX_LOCATIONS
 
 # 会員ごとの番号が入っている列（業種を追加したとき、上の行からコピーする）
 NUMBER_COLUMN = os.getenv("NUMBER_COLUMN", "A").strip().upper() or "A"
@@ -114,6 +115,43 @@ class _Table:
                 raise RuntimeError(f"入力シートに「{header}」という見出しの列が見つかりません。")
             self.cols[header] = headers.index(header) + 1
 
+        # 活動地域の列（1始まり。無い列は None）。①は必須
+        self.loc_cols = [
+            (p + 1 if p is not None else None, c + 1 if c is not None else None)
+            for p, c in sheets_client.location_columns(headers)
+        ]
+        if None in self.loc_cols[0]:
+            raise RuntimeError(
+                f"入力シートに「{sheets_client.HEADER_PREFECTURE}」「{sheets_client.HEADER_CITY}」の列が見つかりません。"
+            )
+
+    def raw(self, row: int, col: int | None) -> str:
+        if col is None:
+            return ""
+        line = self.values[row - 1] if 0 < row <= len(self.values) else []
+        return _clean(line[col - 1]) if len(line) >= col else ""
+
+    def slots(self, row: int) -> list[tuple[str, str]]:
+        """活動地域の①〜⑤を、空欄も含めて (都道府県, 市町村) の5つ組で返す。"""
+        return [(self.raw(row, p), self.raw(row, c)) for p, c in self.loc_cols]
+
+    def locations(self, row: int) -> list[dict]:
+        return [{"prefecture": p, "city": c} for p, c in self.slots(row) if p or c]
+
+    def slot_updates(self, row: int, new_slots: list[tuple[str, str]]) -> list[dict]:
+        """①〜⑤を new_slots に書き換えるためのセル更新（足りない分は空欄にする）。"""
+        new_slots = list(new_slots) + [("", "")] * (len(self.loc_cols) - len(new_slots))
+        updates = []
+        for (p_col, c_col), (pref, city) in zip(self.loc_cols, new_slots):
+            for col, value in ((p_col, pref), (c_col, city)):
+                if col is None:
+                    if value:
+                        raise ProfileError("入力シートに都道府県・市町村の列が足りません。運営に連絡してください。")
+                    continue
+                if self.raw(row, col) != value:
+                    updates.append({"range": _a1(row, col), "values": [[value]]})
+        return updates
+
     def cell(self, row: int, header: str) -> str:
         line = self.values[row - 1] if 0 < row <= len(self.values) else []
         col = self.cols[header]
@@ -177,8 +215,7 @@ def get_profile(discord_id: str) -> dict:
         "name": name,
         "age": table.cell(first, sheets_client.HEADER_AGE),
         "gender": table.cell(first, sheets_client.HEADER_GENDER),
-        "prefecture": table.cell(first, sheets_client.HEADER_PREFECTURE),
-        "city": table.cell(first, sheets_client.HEADER_CITY),
+        "locations": table.locations(first),
         "businesses": businesses,
     }
 
@@ -189,7 +226,7 @@ def get_profile(discord_id: str) -> dict:
 
 def update_fields(discord_id: str, changes: dict) -> dict:
     """
-    名前・年齢・性別・都道府県・市町村を、その人の全部の行でまとめて書き換える。
+    名前・年齢・性別を、その人の全部の行でまとめて書き換える。
     戻り値は {項目: (変更前, 変更後)}（実際に変わったものだけ）。
     """
     with _lock:
@@ -229,6 +266,99 @@ def update_fields(discord_id: str, changes: dict) -> dict:
                 updates.append({"range": _a1(row, col), "values": [[new_value]]})
         _write_cells(updates)
         return diffs
+
+
+def update_locations(discord_id: str, locations: list[dict]) -> tuple[list[dict], list[dict]] | None:
+    """
+    活動地域（都道府県①・市町村① 〜 ⑤）を、その人の全部の行でまとめて書き換える。
+    locations は [{"prefecture": ..., "city": ...}, ...]（1〜5件。先頭が①）。
+    戻り値は (変更前, 変更後)。変わらなければ None。
+    """
+    locations = [
+        {"prefecture": _clean(loc.get("prefecture")), "city": _clean(loc.get("city"))}
+        for loc in locations
+        if _clean(loc.get("prefecture")) or _clean(loc.get("city"))
+    ]
+    if not locations:
+        raise ProfileError("都道府県を1つ以上選んでください。")
+    if len(locations) > MAX_LOCATIONS:
+        raise ProfileError(f"地域は{MAX_LOCATIONS}つまで登録できます。")
+
+    with _lock:
+        table = _read_table()
+        _name, rows = table.member_rows(discord_id)
+        before = table.locations(rows[0])
+        if before == locations and all(table.locations(r) == locations for r in rows):
+            return None
+        new_slots = [(loc["prefecture"], loc["city"]) for loc in locations]
+        updates = []
+        for row in rows:
+            updates.extend(table.slot_updates(row, new_slots))
+        _write_cells(updates)
+        return before, locations
+
+
+def append_new_member_rows(base_profile: dict, businesses: list[dict]) -> None:
+    """
+    新規会員の行を、入力シートの最後に業種・事業内容の件数だけ追加する（名前登録のプロフィール入力から）。
+    名前・年齢・性別・活動地域①〜⑤・DiscordIDは全部の行に同じ値を入れる。
+    番号の列（A列）は、今ある番号のいちばん大きい数字＋1を入れる（数字が入っていなければ空欄のまま）。
+
+    base_profile：name, discord_id, age, gender, locations（[{"prefecture", "city"}, ...]）
+    businesses  ：[{"type": ..., "content": ...}, ...]（1件以上）
+    """
+    if not businesses:
+        raise ValueError("businesses は1件以上必要です。")
+
+    locations = base_profile.get("locations") or []
+    new_slots = [(_clean(l.get("prefecture")), _clean(l.get("city"))) for l in locations][:MAX_LOCATIONS]
+
+    with _lock:
+        table = _read_table()
+        name_col = table.cols[sheets_client.HEADER_NAME]
+        # 書き込み先＝「名前（本名）」列で最後に値が入っている行の次の行
+        last_filled = max([r for r in table.rows() if table.raw(r, name_col)], default=1)
+        start_row = last_filled + 1
+
+        sheet = _get_sheet()
+        needed_last_row = start_row + len(businesses) - 1
+        if needed_last_row > sheet.row_count:
+            _with_retry(sheet.add_rows, needed_last_row - sheet.row_count)
+
+        number_col = gspread.utils.a1_to_rowcol(f"{NUMBER_COLUMN}1")[1]
+        numbers = []
+        for r in table.rows():
+            try:
+                numbers.append(int(float(table.raw(r, number_col))))
+            except ValueError:
+                pass
+        next_number = max(numbers) + 1 if numbers else None
+
+        updates, number_updates = [], []
+        for index, biz in enumerate(businesses):
+            row = start_row + index
+            fields = {
+                sheets_client.HEADER_NAME: base_profile.get("name", ""),
+                sheets_client.HEADER_DISCORD_ID: str(base_profile.get("discord_id", "")),
+                sheets_client.HEADER_AGE: base_profile.get("age", ""),
+                sheets_client.HEADER_GENDER: base_profile.get("gender", ""),
+                sheets_client.HEADER_BUSINESS_TYPE: biz.get("type", ""),
+                sheets_client.HEADER_BUSINESS_CONTENT: biz.get("content", ""),
+            }
+            for header, value in fields.items():
+                if value:
+                    updates.append({"range": _a1(row, table.cols[header]), "values": [[_clean(value)]]})
+            for (p_col, c_col), (pref, city) in zip(table.loc_cols, new_slots):
+                for col, value in ((p_col, pref), (c_col, city)):
+                    if col is not None and value:
+                        updates.append({"range": _a1(row, col), "values": [[value]]})
+            if next_number is not None:
+                number_updates.append({"range": _a1(row, number_col), "values": [[next_number]]})
+
+        _write_cells(updates)
+        if number_updates:
+            # 番号は数字として入れる（RAWだと文字扱いになるため）
+            _with_retry(sheet.batch_update, number_updates, value_input_option="USER_ENTERED")
 
 
 def add_business(discord_id: str, business_type: str, content: str) -> int:
@@ -277,9 +407,15 @@ def add_business(discord_id: str, business_type: str, content: str) -> int:
             sheets_client.HEADER_BUSINESS_TYPE: business_type,
             sheets_client.HEADER_BUSINESS_CONTENT: content,
         }
+        location_updates = []
         if target != first:
             for header in FIELD_HEADERS.values():
                 values[header] = table.cell(first, header)
+            # 活動地域①〜⑤も同じ人の行からコピーする
+            for (p_col, c_col), (pref, city) in zip(table.loc_cols, table.slots(first)):
+                for col, value in ((p_col, pref), (c_col, city)):
+                    if col is not None and value:
+                        location_updates.append({"range": _a1(target, col), "values": [[value]]})
             # DiscordIDも全部の行に入れる（入力シートの今の形式に合わせる）
             values[sheets_client.HEADER_DISCORD_ID] = str(discord_id)
 
@@ -319,6 +455,7 @@ def add_business(discord_id: str, business_type: str, content: str) -> int:
                 for header, value in values.items()
                 if value
             ]
+            + location_updates
         )
         return target
 
@@ -375,38 +512,74 @@ def delete_business(discord_id: str, row: int, expected: tuple[str, str]):
 # 都道府県の表記ゆれの一括統一（管理者コマンド「!都道府県統一」用）
 # ---------------------------------------------------------------------------
 
+def _fix_slots(slots: list[tuple[str, str]]) -> list[tuple[str, str]] | None:
+    """
+    1行の活動地域①〜⑤をそろえ直す。
+    - 「大阪」→「大阪府」のように正式名称にする
+    - 1つのセルに「大阪府、東京都」のように複数入っていたら、②③…に分ける
+      （市町村も同じ数だけ区切られていれば、順番どおりに分ける。そうでなければ最初の地域に残す）
+    判断できない都道府県がある、または5つを超える場合は None。
+    """
+    result: list[tuple[str, str]] = []
+    for pref, city in slots:
+        if not pref and not city:
+            continue
+        if not pref:
+            result.append(("", city))
+            continue
+        names = prefectures.split_prefectures(pref)
+        if not names:
+            return None
+        cities = prefectures.split_cities(city)
+        if len(names) > 1 and len(cities) == len(names):
+            pairs = list(zip(names, cities))
+        else:
+            pairs = [(names[0], city)] + [(n, "") for n in names[1:]]
+        for name, c in pairs:
+            existing = next((i for i, (p, _c) in enumerate(result) if p == name), None)
+            if existing is None:
+                result.append((name, c))
+            elif c and not result[existing][1]:
+                result[existing] = (name, c)
+    if len(result) > MAX_LOCATIONS:
+        return None
+    return result
+
+
+def _slots_text(slots: list[tuple[str, str]]) -> str:
+    return "・".join(f"{p}{('（' + c + '）') if c else ''}" for p, c in slots if p or c)
+
+
 def plan_prefecture_fix() -> dict:
     """
-    入力シートの都道府県を調べ、そろえる予定の一覧を返す（まだ書き込まない）。
-      changes    : [(行番号, 名前, 今の値, 直した値)]
-      unresolved : [(行番号, 名前, 今の値)]  都道府県と判断できなかったもの（手で直してもらう）
+    入力シートの活動地域①〜⑤を調べ、そろえる予定の一覧を返す（まだ書き込まない）。
+      changes    : [(行番号, 名前, 今の内容, 直した内容, 今の①〜⑤, 直した①〜⑤)]
+      unresolved : [(行番号, 名前, 今の内容)]  都道府県と判断できなかったもの・5つを超えるもの
     """
     table = _read_table()
     changes, unresolved = [], []
     for row in table.rows():
-        current = table.cell(row, sheets_client.HEADER_PREFECTURE)
+        slots = table.slots(row)
+        current = [s for s in slots if s[0] or s[1]]
         if not current:
             continue
         name = table.cell(row, sheets_client.HEADER_NAME)
-        fixed = prefectures.normalize_prefecture(current)
+        fixed = _fix_slots(slots)
         if fixed is None:
-            unresolved.append((row, name, current))
+            unresolved.append((row, name, _slots_text(current)))
         elif fixed != current:
-            changes.append((row, name, current, fixed))
+            changes.append((row, name, _slots_text(current), _slots_text(fixed), slots, fixed))
     return {"changes": changes, "unresolved": unresolved}
 
 
 def apply_prefecture_fix(changes: list[tuple]) -> int:
-    """plan_prefecture_fix の changes を書き込む。行の内容が変わっていたものは飛ばす。戻り値は書き換えた件数。"""
+    """plan_prefecture_fix の changes を書き込む。行の内容が変わっていたものは飛ばす。戻り値は書き換えた行数。"""
     with _lock:
         table = _read_table()
-        col = table.cols[sheets_client.HEADER_PREFECTURE]
-        updates = []
-        for row, name, current, fixed in changes:
-            if (
-                table.cell(row, sheets_client.HEADER_NAME) == name
-                and table.cell(row, sheets_client.HEADER_PREFECTURE) == current
-            ):
-                updates.append({"range": _a1(row, col), "values": [[fixed]]})
+        updates, count = [], 0
+        for row, name, _current, _fixed, old_slots, new_slots in changes:
+            if table.cell(row, sheets_client.HEADER_NAME) == name and table.slots(row) == old_slots:
+                updates.extend(table.slot_updates(row, new_slots))
+                count += 1
         _write_cells(updates)
-        return len(updates)
+        return count
