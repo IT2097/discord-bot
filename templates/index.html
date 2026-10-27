@@ -19,6 +19,8 @@
     }
     .more-btn:hover { text-decoration: underline; }
     .card .request-btn { margin-top: auto; }
+    /* 活動地域が複数ある人も全部読めるよう、年齢・性別・地域の行は折り返す */
+    .card .meta { white-space: normal; overflow: visible; text-overflow: clip; }
     /* 申請ボタンと取り消しボタン（状態に合わせて片方だけ表示） */
     .request-actions { margin-top: auto; display: flex; flex-direction: column; gap: 8px; }
     .request-actions .request-btn { margin-top: 0; width: 100%; }
@@ -143,7 +145,7 @@
            data-search="{{ member.search_blob }}"
            data-age="{{ member.age }}"
            data-gender="{{ member.gender }}"
-           data-prefecture="{{ member.prefecture }}"
+           data-prefectures="{{ member.prefecture_list | join('|') }}"
            data-id="{{ member.discord_id }}">
         <div class="card-top">
           <div class="identity">
@@ -154,7 +156,7 @@
             {% endif %}
             <div class="name-block">
               <div class="name">{{ member.name }}</div>
-              <div class="meta">{{ [member.age, member.gender, (member.prefecture ~ member.city)] | select | join(' ・ ') }}</div>
+              <div class="meta">{{ [member.age, member.gender, member.location_text] | select | join(' ・ ') }}</div>
             </div>
           </div>
           {% if member.discord_id not in matched %}
@@ -241,7 +243,8 @@
         const matchesKeyword = !keyword || card.dataset.search.includes(keyword);
         const matchesAge = !age || card.dataset.age === age;
         const matchesGender = !gender || card.dataset.gender === gender;
-        const matchesPrefecture = !prefecture || card.dataset.prefecture === prefecture;
+        // 活動地域が複数ある人は、どれか1つが一致すれば表示する
+        const matchesPrefecture = !prefecture || (card.dataset.prefectures || '').split('|').includes(prefecture);
 
         const matchesKnown = !hideKnown || !card.classList.contains('known');
 
