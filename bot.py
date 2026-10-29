@@ -31,7 +31,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-27 地域5つ対応版"
+BOT_VERSION = "2026-10-29 退会時ルーム1週間後削除版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -1545,16 +1545,108 @@ async def run_member_archive(guild: discord.Guild, discord_id: str, display_name
     )
 
 
+# ---------------------------------------------------------------------------
+# 退会した人がいるマッチングルームの後片付け
+#
+# 片方が退会したら、すぐには消さずに、残った人へメンションで知らせる。
+# ROOM_DELETE_DAYS 日後（標準は7日）に、ルームを自動で削除する。
+# 削除予定日時はチャンネルの「トピック」に書いておくので、botが再起動しても忘れない。
+# 運営がトピックから [delete_at:...] の部分を消せば、自動削除を取りやめられる。
+# ---------------------------------------------------------------------------
+
+ROOM_DELETE_DAYS = float(os.getenv("ROOM_DELETE_DAYS", "7"))
+_DELETE_MARK_PREFIX = "[delete_at:"
+
+
+def _rooms_with_member(guild: discord.Guild, member_id: int) -> list[discord.TextChannel]:
+    """マッチングルームのカテゴリにあり、権限にこの人が個別に入っているチャンネル。"""
+    rooms = []
+    for channel in guild.text_channels:
+        if channel.category is None or not match_views._is_match_category(channel.category):
+            continue
+        for target, overwrite in channel.overwrites.items():
+            if target.id == member_id and overwrite.view_channel is True:
+                rooms.append(channel)
+                break
+    return rooms
+
+
+def _room_delete_at(channel: discord.TextChannel) -> float | None:
+    topic = channel.topic or ""
+    start = topic.find(_DELETE_MARK_PREFIX)
+    if start < 0:
+        return None
+    end = topic.find("]", start)
+    try:
+        return float(topic[start + len(_DELETE_MARK_PREFIX):end])
+    except ValueError:
+        return None
+
+
+async def schedule_room_deletion(member: discord.Member):
+    """退会した人がいたマッチングルームに、残った人あてのお知らせを出し、削除予定を書き込む。"""
+    delete_at = datetime.now(timezone.utc) + timedelta(days=ROOM_DELETE_DAYS)
+    delete_text = match_views._format_jst(delete_at.timestamp())
+    for channel in _rooms_with_member(member.guild, member.id):
+        if _room_delete_at(channel) is not None:
+            continue  # すでに削除予定（もう1人も先に退会しているなど）
+        remaining = [
+            target
+            for target, overwrite in channel.overwrites.items()
+            if isinstance(target, discord.Member)
+            and not target.bot
+            and target.id != member.id
+            and overwrite.view_channel is True
+        ]
+        mentions = " ".join(m.mention for m in remaining)
+        try:
+            await channel.send(
+                f"{mentions}\n"
+                f"🚪 {member.display_name} さんは、リジェを退会されました。\n"
+                f"このマッチングルームは **{delete_text}** に自動で削除されます。\n"
+                "必要なやり取りや連絡先があれば、それまでに控えておいてください。",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+            topic = f"🗑️ {member.display_name} さんの退会により、{delete_text} に自動で削除されます {_DELETE_MARK_PREFIX}{int(delete_at.timestamp())}]"
+            await channel.edit(topic=topic[:1024])
+        except discord.HTTPException as error:
+            print(f"「{channel.name}」に退会のお知らせを出せませんでした：{error}")
+
+
+async def delete_due_rooms(guild: discord.Guild) -> int:
+    """削除予定日時を過ぎたマッチングルームを削除する（30分ごとの定期処理から呼ぶ）。"""
+    now = datetime.now(timezone.utc).timestamp()
+    deleted = 0
+    for channel in list(guild.text_channels):
+        if channel.category is None or not match_views._is_match_category(channel.category):
+            continue
+        delete_at = _room_delete_at(channel)
+        if delete_at is None or delete_at > now:
+            continue
+        try:
+            await channel.delete(reason="退会した会員がいるマッチングルームの自動削除")
+            deleted += 1
+        except discord.HTTPException as error:
+            print(f"「{channel.name}」の自動削除に失敗しました：{error}")
+    return deleted
+
+
 @bot.event
 async def on_member_remove(member: discord.Member):
     """
     メンバーがサーバーからいなくなったら（キック・自主退会・BANのどれでも）、
     入力シートの行を退会者シートへ移す。
+    その人がいたマッチングルームは、残った人に知らせてから、ROOM_DELETE_DAYS 日後に削除する。
     """
     if member.bot:
         return
     if os.getenv("GUILD_ID") and str(member.guild.id) != os.getenv("GUILD_ID"):
         return  # 本番サーバー以外（テストサーバー等）では何もしない
+
+    try:
+        await schedule_room_deletion(member)
+    except Exception as error:  # noqa: BLE001 - ルームの処理に失敗しても退会処理は続ける
+        print(f"退会した人のマッチングルームの処理でエラー：{error}")
 
     await run_member_archive(member.guild, str(member.id), member.display_name, "サーバーから退出しました")
 
@@ -1590,6 +1682,15 @@ async def check_match_requests():
         await match_views.process_pending_requests(bot)
     except Exception as error:  # noqa: BLE001 - 定期処理が止まらないようにログだけ残す
         print(f"申請のリマインド・期限切れ処理でエラー：{error}")
+
+    # 退会した人がいるマッチングルームのうち、削除予定日時を過ぎたものを削除する
+    guild_id = os.getenv("GUILD_ID")
+    guild = bot.get_guild(int(guild_id)) if guild_id else None
+    if guild is not None:
+        try:
+            await delete_due_rooms(guild)
+        except Exception as error:  # noqa: BLE001
+            print(f"マッチングルームの自動削除でエラー：{error}")
 
 
 # ---------------------------------------------------------------------------
