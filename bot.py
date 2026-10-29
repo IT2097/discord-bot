@@ -14,7 +14,6 @@ import match_store
 import match_records
 import inquiry
 import member_archive
-import prefectures
 import profile_edit
 import profile_sheet
 import sheet_sync

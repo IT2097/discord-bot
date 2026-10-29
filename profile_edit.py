@@ -29,28 +29,6 @@ find_log_channel: Callable[[discord.Guild], discord.abc.Messageable | None] | No
 # 共通の部品
 # ---------------------------------------------------------------------------
 
-def build_prefecture_selects(selected: str | None, on_select) -> list[discord.ui.Select]:
-    """
-    47都道府県を2つのプルダウンに分けて作る（Discordのプルダウンは25個までのため）。
-    選ばれている都道府県には印（default）を付ける。on_select(interaction, 選んだ都道府県) を呼ぶ。
-    """
-    selects = []
-    for placeholder, names in prefectures.PREFECTURE_GROUPS:
-        select = discord.ui.Select(
-            placeholder=placeholder,
-            options=[discord.SelectOption(label=name, default=(name == selected)) for name in names],
-            min_values=1,
-            max_values=1,
-        )
-
-        async def callback(interaction: discord.Interaction, _select=select):
-            await on_select(interaction, _select.values[0])
-
-        select.callback = callback
-        selects.append(select)
-    return selects
-
-
 def mark_defaults(select: discord.ui.Select, selected: str | None):
     for option in select.options:
         option.default = option.value == selected
