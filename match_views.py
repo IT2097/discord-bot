@@ -74,6 +74,308 @@ def is_private_match_room(channel: discord.TextChannel) -> list[str] | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# マッチングルームのスレッド化
+#
+# チャンネルは1サーバー500個までなので、マッチングルームを「マッチングルーム」チャンネルの中の
+# プライベートスレッドとして作る（スレッドはチャンネル数に入らない）。
+# MATCH_ROOM_MODE で切り替える：
+#   admin … 2人のどちらかが管理者のときだけスレッド（テスト用。標準）
+#   all   … すべてスレッド
+#   off   … すべて今までどおりチャンネル
+# どのスレッドが誰のルームかは、マッチング履歴シートの「ルームID」で管理する。
+# ---------------------------------------------------------------------------
+
+MATCH_ROOM_CHANNEL_NAME = os.getenv("MATCH_ROOM_CHANNEL_NAME", "マッチングルーム")
+MATCH_ROOM_MODE = os.getenv("MATCH_ROOM_MODE", "admin").strip().lower()
+ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "管理者")
+
+# 「マッチングルーム」チャンネルでbotに必要な権限（スレッドを作る・アーカイブを戻す・移行で書き写す）
+ROOM_PARENT_BOT_PERMISSIONS = dict(
+    view_channel=True,
+    send_messages=True,
+    read_message_history=True,
+    embed_links=True,
+    attach_files=True,
+    manage_messages=True,
+    manage_webhooks=True,
+    create_private_threads=True,
+    send_messages_in_threads=True,
+    manage_threads=True,
+)
+
+
+def find_room_parent(guild: discord.Guild) -> discord.TextChannel | None:
+    """
+    スレッドを作る親の「マッチングルーム」チャンネル。
+    同じ名前のチャンネルが他にもある場合に備え、マッチングルームのカテゴリの中にあるものを優先する。
+    """
+    candidates = [c for c in guild.text_channels if c.name == MATCH_ROOM_CHANNEL_NAME]
+    for channel in candidates:
+        if channel.category is not None and _is_match_category(channel.category):
+            return channel
+    return None
+
+
+def is_room_parent(channel) -> bool:
+    return (
+        isinstance(channel, discord.TextChannel)
+        and channel.name == MATCH_ROOM_CHANNEL_NAME
+        and channel.category is not None
+        and _is_match_category(channel.category)
+    )
+
+
+def _is_admin(member: discord.Member) -> bool:
+    return member.guild_permissions.administrator or any(r.name == ADMIN_ROLE_NAME for r in member.roles)
+
+
+def use_thread_for(member_a: discord.Member, member_b: discord.Member) -> bool:
+    if MATCH_ROOM_MODE == "all":
+        return True
+    if MATCH_ROOM_MODE == "admin":
+        return _is_admin(member_a) or _is_admin(member_b)
+    return False
+
+
+async def setup_room_parent(guild: discord.Guild, member_role: discord.Role | None) -> discord.TextChannel:
+    """
+    「マッチングルーム」チャンネルの権限を、スレッド方式に合わせて設定する。
+    会員はチャンネルは見えるが、チャンネルへの投稿やスレッドの作成はできない。
+    自分が入っているスレッド（自分のマッチングルーム）の中では発言できる。
+    """
+    channel = find_room_parent(guild)
+    if channel is None:
+        raise RuntimeError(
+            f"「{MATCH_CATEGORY_NAME}」カテゴリの中に「{MATCH_ROOM_CHANNEL_NAME}」チャンネルが見つかりません。"
+        )
+    await channel.set_permissions(guild.me, **ROOM_PARENT_BOT_PERMISSIONS)
+    await channel.set_permissions(guild.default_role, view_channel=False)
+    if member_role is not None:
+        await channel.set_permissions(
+            member_role,
+            view_channel=True,
+            read_message_history=True,
+            send_messages=False,
+            add_reactions=True,
+            create_public_threads=False,
+            create_private_threads=False,
+            send_messages_in_threads=True,
+            attach_files=True,
+            embed_links=True,
+        )
+    return channel
+
+
+async def _post_room_intro(room, member_a: discord.Member, member_b: discord.Member):
+    await room.send(f"{member_a.mention} と {member_b.mention} のマッチングルームです！")
+    # お互いのプロフィール（スプレッドシートの情報）を1通ずつ投稿する
+    for member in (member_a, member_b):
+        try:
+            profile = await asyncio.to_thread(sheets_client.find_member, str(member.id))
+        except Exception:  # noqa: BLE001 - シート取得に失敗してもルーム作成自体は継続する
+            profile = None
+        if profile:
+            await room.send(_format_profile(profile))
+
+
+async def create_match_thread(
+    guild: discord.Guild, member_a: discord.Member, member_b: discord.Member, intro: bool = True
+) -> discord.Thread:
+    """「マッチングルーム」チャンネルの中に、2人だけが入れるプライベートスレッドを作る。"""
+    parent = find_room_parent(guild)
+    if parent is None:
+        raise RuntimeError(f"「{MATCH_ROOM_CHANNEL_NAME}」チャンネルが見つかりません。")
+    thread = await parent.create_thread(
+        name=f"{member_a.display_name}-{member_b.display_name}"[:100],
+        type=discord.ChannelType.private_thread,
+        invitable=False,
+        auto_archive_duration=10080,  # 7日（さらに、botが定期的にアーカイブを戻して一覧から隠れないようにする）
+    )
+    await thread.add_user(member_a)
+    await thread.add_user(member_b)
+    if intro:
+        await _post_room_intro(thread, member_a, member_b)
+    return thread
+
+
+async def create_match_room(guild: discord.Guild, member_a: discord.Member, member_b: discord.Member):
+    """
+    マッチングルームを作り、マッチング履歴に2人とルームIDを記録する。
+    スレッド方式の対象（MATCH_ROOM_MODE）で、親チャンネルがあればスレッド、そうでなければチャンネルを作る。
+    """
+    if use_thread_for(member_a, member_b) and find_room_parent(guild) is not None:
+        room = await create_match_thread(guild, member_a, member_b)
+    else:
+        room = await create_match_channel(guild, member_a, member_b)
+    match_store.mark_matched(str(member_a.id), str(member_b.id))
+    try:
+        await asyncio.to_thread(match_records.append_match, str(member_a.id), str(member_b.id), room.id)
+    except Exception as error:  # noqa: BLE001 - 記録に失敗してもルームは作れている
+        print(f"マッチング履歴の記録に失敗しました：{error}")
+    return room
+
+
+async def room_pair(room) -> list[str] | None:
+    """
+    マッチングルームの2人のDiscordIDを返す（マッチングルームでなければ None）。
+    チャンネル：権限に個別に入っている2人。スレッド：マッチング履歴のルームIDから。
+    """
+    if isinstance(room, discord.Thread):
+        if not is_room_parent(room.parent):
+            return None
+        return await asyncio.to_thread(match_records.pair_for_room, room.id)
+    if isinstance(room, discord.TextChannel) and room.category is not None and _is_match_category(room.category):
+        return is_private_match_room(room)
+    return None
+
+
+async def keep_room_threads_open(guild: discord.Guild) -> int:
+    """アーカイブされた（一覧から隠れた）マッチングルームのスレッドを元に戻す。戻した数を返す。"""
+    parent = find_room_parent(guild)
+    if parent is None:
+        return 0
+    room_ids = {r["room_id"] for r in await asyncio.to_thread(match_records.get_all_records)}
+    restored = 0
+    async for thread in parent.archived_threads(private=True, limit=None):
+        if str(thread.id) not in room_ids:
+            continue
+        try:
+            await thread.edit(archived=False, auto_archive_duration=10080)
+            restored += 1
+        except discord.HTTPException as error:
+            print(f"スレッド「{thread.name}」のアーカイブを戻せませんでした：{error}")
+    return restored
+
+
+# ---------------------------------------------------------------------------
+# 今までのマッチングルーム（チャンネル）を、スレッドへ移す
+# 過去のメッセージを、発言した人の名前とアイコンでスレッドに書き写してから、古いチャンネルを消す。
+# （Discordにはメッセージを移動する機能がないため。元の投稿日時は各メッセージの先頭に書く）
+# ---------------------------------------------------------------------------
+
+_MIGRATION_WEBHOOK_NAME = "マッチングルーム移行"
+_JST_ZONE = timezone(timedelta(hours=9))
+
+
+def _webhook_username(name: str) -> str:
+    # Webhookの名前には「discord」「clyde」が使えず、80文字まで
+    for banned in ("discord", "Discord", "DISCORD", "clyde", "Clyde", "CLYDE"):
+        name = name.replace(banned, banned[0] + "\u200b" + banned[1:])
+    return (name or "（名前なし）")[:80]
+
+
+def _split_text(text: str, limit: int = 1900) -> list[str]:
+    parts = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        cut = cut if cut > 0 else limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    parts.append(text)
+    return parts
+
+
+async def _migration_webhook(parent: discord.TextChannel) -> discord.Webhook:
+    for webhook in await parent.webhooks():
+        if webhook.name == _MIGRATION_WEBHOOK_NAME and webhook.token:
+            return webhook
+    return await parent.create_webhook(name=_MIGRATION_WEBHOOK_NAME)
+
+
+async def migrate_room_channel(channel: discord.TextChannel) -> tuple[discord.Thread, int]:
+    """
+    マッチングルームのチャンネルを、スレッドに移す。
+    戻り値は (新しいスレッド, 書き写したメッセージ数)。移せない場合は RuntimeError。
+    """
+    guild = channel.guild
+    pair = is_private_match_room(channel)
+    if not pair:
+        raise RuntimeError(f"「{channel.name}」は2人のマッチングルームではありません。")
+    parent = find_room_parent(guild)
+    if parent is None:
+        raise RuntimeError(f"「{MATCH_ROOM_CHANNEL_NAME}」チャンネルが見つかりません。")
+
+    members = []
+    for member_id in pair:
+        member = guild.get_member(int(member_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(member_id))
+            except discord.HTTPException:
+                raise RuntimeError(f"「{channel.name}」の会員（ID {member_id}）がサーバーにいないため移せません。")
+        members.append(member)
+
+    thread = await create_match_thread(guild, members[0], members[1], intro=False)
+    thread_name = channel.name if channel.name else thread.name
+    try:
+        await thread.edit(name=thread_name[:100])
+    except discord.HTTPException:
+        pass
+    await thread.send(
+        "📦 このスレッドは、以前のマッチングルーム（チャンネル）から移したものです。\n"
+        "ここから下は、これまでのやり取りの写しです（元の投稿日時を、各メッセージの上に小さく書いています）。"
+    )
+
+    webhook = await _migration_webhook(parent)
+    copied = 0
+    async for message in channel.history(limit=None, oldest_first=True):
+        if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+            continue
+        posted = message.created_at.astimezone(_JST_ZONE).strftime("%Y/%m/%d %H:%M")
+        text = f"-# {posted}\n{message.content}" if message.content else f"-# {posted}"
+        files = []
+        notes = []
+        for attachment in message.attachments:
+            try:
+                files.append(await attachment.to_file())
+            except discord.HTTPException:
+                notes.append(f"（添付ファイル：{attachment.filename} は移せませんでした）")
+        if notes:
+            text += "\n" + "\n".join(notes)
+        embeds = [e for e in message.embeds if e.type == "rich"][:10]
+        chunks = _split_text(text)
+        for index, chunk in enumerate(chunks):
+            last = index == len(chunks) - 1
+            try:
+                await webhook.send(
+                    content=chunk,
+                    username=_webhook_username(message.author.display_name),
+                    avatar_url=message.author.display_avatar.url,
+                    thread=thread,
+                    files=files if last else discord.utils.MISSING,
+                    embeds=embeds if last else discord.utils.MISSING,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    wait=True,
+                )
+            except discord.HTTPException:
+                # ファイルが大きすぎるなどで送れなかったときは、文章だけでも送る
+                if last and (files or embeds):
+                    await webhook.send(
+                        content=chunk + "\n（添付ファイルは大きすぎるため移せませんでした）",
+                        username=_webhook_username(message.author.display_name),
+                        avatar_url=message.author.display_avatar.url,
+                        thread=thread,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                        wait=True,
+                    )
+                else:
+                    raise
+        copied += 1
+
+    await thread.send(
+        "── ここまでが、移す前のやり取りです ──\n"
+        f"{members[0].mention} {members[1].mention}\n"
+        "マッチングルームを、このスレッドに移しました。これからはこちらでやり取りしてください。"
+    )
+
+    # 履歴のルームIDを新しいスレッドにしてから、古いチャンネルを消す
+    # （先にルームIDを変えておくので、古いチャンネルを消しても履歴は消えない）
+    await asyncio.to_thread(match_records.set_room, pair[0], pair[1], thread.id)
+    await channel.delete(reason="マッチングルームをスレッドに移行")
+    return thread, copied
+
+
 def _location_lines(member: dict) -> list[str]:
     """活動地域の行。1か所なら「地域：北海道札幌市」、複数なら1か所ずつ番号を付けて並べる。"""
     locations = member.get("locations") or (
@@ -365,14 +667,14 @@ async def _handle_approve(interaction: discord.Interaction, request_id: str):
         return
 
     try:
-        channel = await create_match_channel(guild, requester, target)
+        channel = await create_match_room(guild, requester, target)
     except discord.Forbidden:
         await interaction.followup.send(
             "Botに「チャンネルを管理」の権限がありません。管理者に連絡してください。", ephemeral=True
         )
         return
-    except discord.HTTPException as error:
-        await interaction.followup.send(f"チャンネル作成に失敗しました：{error}", ephemeral=True)
+    except (discord.HTTPException, RuntimeError) as error:
+        await interaction.followup.send(f"マッチングルームの作成に失敗しました：{error}", ephemeral=True)
         return
 
     await interaction.followup.send(
@@ -382,12 +684,7 @@ async def _handle_approve(interaction: discord.Interaction, request_id: str):
         # 承認が済んだら、申請スレッドはすぐに消す
         await _remove_request_thread(interaction.message, None, 0)
 
-    match_store.mark_matched(request["requester_id"], request["target_id"])
-    try:
-        # スプレッドシートへの書き込みはブロッキング処理なので別スレッドで実行する
-        await asyncio.to_thread(match_records.append_match, request["requester_id"], request["target_id"])
-    except Exception:  # noqa: BLE001 - 永続化に失敗してもマッチング自体は成立させる
-        print("マッチング履歴の永続化に失敗しました。")
+    # マッチング成立の記録（履歴シートへのルームIDつきの書き込み）は create_match_room の中で行う
 
     try:
         await requester.send(

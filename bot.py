@@ -30,7 +30,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-10-29 退会時ルーム1週間後削除版"
+BOT_VERSION = "2026-11-05 マッチングルームのスレッド化（テスト）版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
@@ -319,7 +319,7 @@ class MatchView(discord.ui.View):
             return
 
         try:
-            channel = await match_views.create_match_channel(guild, owner, user)
+            channel = await match_views.create_match_room(guild, owner, user)
             await interaction.followup.send(
                 f"マッチングルームを作成しました：{channel.mention}", ephemeral=True
             )
@@ -653,6 +653,7 @@ async def restore_matches(ctx: commands.Context):
 
     guild = ctx.guild
     found_pairs: set[frozenset] = set()
+    found_rooms: list[tuple] = []
 
     for channel in guild.text_channels:
         member_ids = []
@@ -671,6 +672,7 @@ async def restore_matches(ctx: commands.Context):
         # プライベートなマッチングルームとみなす
         if default_denied and len(member_ids) == 2:
             found_pairs.add(frozenset(member_ids))
+            found_rooms.append((member_ids[0], member_ids[1], channel.id))
 
     if not found_pairs:
         await ctx.send("それらしいプライベートルームは見つかりませんでした。")
@@ -679,7 +681,7 @@ async def restore_matches(ctx: commands.Context):
     try:
         # 1件ずつ書き込むとSheets APIの回数制限（429）に引っかかるため、まとめて1回で書き込む
         added = await asyncio.to_thread(
-            match_records.append_matches, [tuple(pair) for pair in found_pairs]
+            match_records.append_matches, found_rooms
         )
     except Exception as error:  # noqa: BLE001 - 管理者にそのままエラー内容を見せる
         await ctx.send(f"エラーが発生しました：{error}")
@@ -728,10 +730,10 @@ async def organize_match_rooms(ctx: commands.Context):
 class RoomBulkDeleteView(discord.ui.View):
     """「!ルーム一括削除」の確認ボタン（コマンドを打った管理者だけが押せる）。"""
 
-    def __init__(self, author_id: int, channel_ids: list[int]):
+    def __init__(self, author_id: int, room_ids: list[int]):
         super().__init__(timeout=600)
         self.author_id = author_id
-        self.channel_ids = channel_ids
+        self.room_ids = room_ids
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -739,59 +741,72 @@ class RoomBulkDeleteView(discord.ui.View):
             return False
         return True
 
-    async def _run(self, interaction: discord.Interaction, remove_history: bool):
+    @discord.ui.button(label="削除する", style=discord.ButtonStyle.danger)
+    async def delete_rooms(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             content=interaction.message.content + "\n\n⏳ 削除しています…", view=None
         )
-        deleted, failed, history_removed = 0, 0, 0
-        for channel_id in self.channel_ids:
-            channel = interaction.guild.get_channel(channel_id)
-            if channel is None:
+        deleted, failed = 0, 0
+        for room_id in self.room_ids:
+            room = await _get_room(interaction.guild, room_id)
+            if room is None:
                 continue
-            pair = match_views.is_private_match_room(channel)
             try:
-                await channel.delete(reason=f"!ルーム一括削除（{interaction.user}）")
+                # 削除すると on_guild_channel_delete / on_raw_thread_delete でマッチング履歴も消える
+                await room.delete(reason=f"!ルーム一括削除（{interaction.user}）")
                 deleted += 1
             except discord.HTTPException as error:
                 failed += 1
-                print(f"「{channel.name}」の削除に失敗しました：{error}")
-                continue
-            if remove_history and pair and len(pair) == 2:
-                match_store.unmark_matched(pair[0], pair[1])
-                try:
-                    if await asyncio.to_thread(match_records.remove_match, pair[0], pair[1]):
-                        history_removed += 1
-                except Exception as error:  # noqa: BLE001 - 1件失敗しても続ける
-                    print(f"マッチング履歴の削除に失敗しました：{error}")
+                print(f"「{room.name}」の削除に失敗しました：{error}")
 
-        message = f"✅ マッチングルームを {deleted} 件削除しました。"
-        if remove_history:
-            message += f"\n・マッチング履歴から {history_removed} 件削除しました（会員一覧ページで「申請可能」に戻ります）。"
+        message = (
+            f"✅ マッチングルームを {deleted} 件削除しました。"
+            "マッチング履歴からも削除したので、会員一覧ページで「申請可能」に戻ります。"
+        )
         if failed:
-            message += f"\n⚠️ {failed} 件は削除できませんでした（botの「チャンネルの管理」権限を確認してください）。"
+            message += f"\n⚠️ {failed} 件は削除できませんでした（botの権限を確認してください）。"
         await interaction.followup.send(message)
-
-    @discord.ui.button(label="ルームだけ削除", style=discord.ButtonStyle.danger)
-    async def delete_rooms(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._run(interaction, remove_history=False)
-
-    @discord.ui.button(label="ルームとマッチング履歴を削除", style=discord.ButtonStyle.danger)
-    async def delete_rooms_and_history(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._run(interaction, remove_history=True)
 
     @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content=interaction.message.content + "\n\n取りやめました。", view=None)
 
 
+async def _get_room(guild: discord.Guild, room_id: int):
+    """チャンネルまたはスレッドをIDで取り出す（アーカイブ中のスレッドも取りに行く）。"""
+    room = guild.get_channel_or_thread(int(room_id))
+    if room is not None:
+        return room
+    try:
+        return await bot.fetch_channel(int(room_id))
+    except discord.HTTPException:
+        return None
+
+
+async def _all_room_threads(guild: discord.Guild) -> list[discord.Thread]:
+    """「マッチングルーム」チャンネルの中のスレッド（アーカイブ中も含む）。"""
+    parent = match_views.find_room_parent(guild)
+    if parent is None:
+        return []
+    threads = list(parent.threads)
+    known = {t.id for t in threads}
+    try:
+        async for thread in parent.archived_threads(private=True, limit=None):
+            if thread.id not in known:
+                threads.append(thread)
+    except discord.HTTPException:
+        pass
+    return threads
+
+
 @bot.command(name="ルーム一括削除")
 @is_admin()
 async def bulk_delete_rooms(ctx: commands.Context, *, keyword: str):
     """
-    マッチングルームのカテゴリにある、名前に keyword を含むチャンネルをまとめて削除する管理者向けコマンド。
+    マッチングルーム（カテゴリ内のチャンネルと「マッチングルーム」チャンネル内のスレッド）のうち、
+    名前に keyword を含むものをまとめて削除する管理者向けコマンド。
     例：!ルーム一括削除 冨樫惟新運営
-    まず対象の一覧を出し、ボタンを押したときだけ削除する。
-    「ルームとマッチング履歴を削除」を選ぶと、2人のマッチング記録も消す（会員一覧で「申請可能」に戻る）。
+    まず対象の一覧を出し、ボタンを押したときだけ削除する。2人のマッチング履歴も消える。
     """
     keyword = keyword.strip()
     if not keyword:
@@ -803,23 +818,230 @@ async def bulk_delete_rooms(ctx: commands.Context, *, keyword: str):
         for channel in ctx.guild.text_channels
         if channel.category is not None
         and match_views._is_match_category(channel.category)
+        and not match_views.is_room_parent(channel)
         and keyword in channel.name
     ]
+    targets += [thread for thread in await _all_room_threads(ctx.guild) if keyword in thread.name]
     if not targets:
-        await ctx.send(f"マッチングルームのカテゴリに、名前に「{keyword}」を含むチャンネルは見つかりませんでした。")
+        await ctx.send(f"名前に「{keyword}」を含むマッチングルームは見つかりませんでした。")
         return
 
-    listing = "\n".join(f"・{channel.name}" for channel in targets)
+    listing = "\n".join(
+        f"・{room.name}（{'スレッド' if isinstance(room, discord.Thread) else 'チャンネル'}）" for room in targets
+    )
     head = (
         f"名前に「{keyword}」を含むマッチングルームが {len(targets)} 件あります。\n"
-        "削除したチャンネルは元に戻せません。内容を確認して、ボタンを押してください。"
+        "削除したルームは元に戻せません。2人のマッチング履歴も消えます。内容を確認して、ボタンを押してください。"
     )
-    view = RoomBulkDeleteView(ctx.author.id, [channel.id for channel in targets])
+    view = RoomBulkDeleteView(ctx.author.id, [room.id for room in targets])
     if len(head) + len(listing) > 1800:
         await ctx.send(
             head + "\n（一覧が長いのでファイルにしました）",
             file=discord.File(io.BytesIO(listing.encode("utf-8")), filename="削除するルーム.txt"),
             view=view,
+        )
+    else:
+        await ctx.send(f"{head}\n\n{listing}", view=view)
+
+
+@bot.command(name="マッチングルーム設定")
+@is_admin()
+async def setup_room_parent_command(ctx: commands.Context):
+    """
+    マッチングルームをスレッドで作るための「マッチングルーム」チャンネルの権限を設定する管理者向けコマンド。
+    （「マッチングルーム一覧」カテゴリの中に「マッチングルーム」チャンネルを先に作っておく）
+    """
+    role = discord.utils.get(ctx.guild.roles, name=MEMBER_ROLE_NAME)
+    try:
+        channel = await match_views.setup_room_parent(ctx.guild, role)
+        await channel.edit(
+            topic="あなたのマッチングルームは、このチャンネルの中のスレッドにあります（相手とあなたにだけ表示されます）。"
+        )
+    except (RuntimeError, discord.HTTPException) as error:
+        await ctx.send(f"設定できませんでした：{error}")
+        return
+    mode = {
+        "admin": "テスト中：どちらかが管理者のマッチングだけスレッドで作ります",
+        "all": "すべてのマッチングをスレッドで作ります",
+        "off": "スレッドは使わず、今までどおりチャンネルで作ります",
+    }.get(match_views.MATCH_ROOM_MODE, match_views.MATCH_ROOM_MODE)
+    await ctx.send(f"✅ {channel.mention} を設定しました。\n・今の設定：{mode}（環境変数 MATCH_ROOM_MODE）")
+
+
+class RoomMigrateView(discord.ui.View):
+    """「!ルーム移行 すべて／管理者」の確認ボタン。"""
+
+    def __init__(self, author_id: int, channel_ids: list[int]):
+        super().__init__(timeout=600)
+        self.author_id = author_id
+        self.channel_ids = channel_ids
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("コマンドを打った管理者だけが押せます。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="移行する", style=discord.ButtonStyle.primary)
+    async def run(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content=interaction.message.content + "\n\n⏳ 移行しています…（1件あたり数分かかることがあります）", view=None
+        )
+        await _migrate_channels(interaction.channel, interaction.guild, self.channel_ids)
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content=interaction.message.content + "\n\n取りやめました。", view=None)
+
+
+async def _migrate_channels(report_channel, guild: discord.Guild, channel_ids: list[int]):
+    done, failed = 0, []
+    for channel_id in channel_ids:
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            continue
+        try:
+            thread, copied = await match_views.migrate_room_channel(channel)
+            done += 1
+            await report_channel.send(f"✅ 「{channel.name}」→ {thread.mention}（{copied}件のメッセージを書き写しました）")
+        except Exception as error:  # noqa: BLE001 - 1件失敗しても続ける
+            failed.append(f"・{channel.name}：{error}")
+    message = f"移行が終わりました。成功：{done}件"
+    if failed:
+        message += f"／失敗：{len(failed)}件（失敗したチャンネルは消していません）\n" + "\n".join(failed)
+    await report_channel.send(message[:1900])
+
+
+@bot.command(name="ルーム移行")
+@is_admin()
+async def migrate_rooms(ctx: commands.Context, *, target: str):
+    """
+    今までのマッチングルーム（チャンネル）を、「マッチングルーム」チャンネルの中のスレッドへ移す管理者向けコマンド。
+    過去のメッセージを、発言した人の名前とアイコンでスレッドに書き写してから、古いチャンネルを削除する。
+      !ルーム移行 #チャンネル … そのルームだけ（テスト用）
+      !ルーム移行 管理者      … 管理者が入っているルームだけ
+      !ルーム移行 すべて      … すべてのルーム
+    """
+    target = target.strip()
+    if match_views.find_room_parent(ctx.guild) is None:
+        await ctx.send(f"先に「{match_views.MATCH_CATEGORY_NAME}」カテゴリの中に「{match_views.MATCH_ROOM_CHANNEL_NAME}」チャンネルを作り、`!マッチングルーム設定` を打ってください。")
+        return
+
+    if ctx.message.channel_mentions:
+        channel = ctx.message.channel_mentions[0]
+        await ctx.send(f"「{channel.name}」を移行しています…")
+        await _migrate_channels(ctx.channel, ctx.guild, [channel.id])
+        return
+
+    rooms = [
+        channel
+        for channel in ctx.guild.text_channels
+        if channel.category is not None
+        and match_views._is_match_category(channel.category)
+        and not match_views.is_room_parent(channel)
+        and match_views.is_private_match_room(channel)
+    ]
+    if target == "管理者":
+        def has_admin(channel):
+            return any(
+                isinstance(t, discord.Member) and match_views._is_admin(t)
+                for t, o in channel.overwrites.items()
+                if o.view_channel is True and not getattr(t, "bot", False)
+            )
+        rooms = [c for c in rooms if has_admin(c)]
+    elif target != "すべて":
+        await ctx.send("使い方：`!ルーム移行 #チャンネル`／`!ルーム移行 管理者`／`!ルーム移行 すべて`")
+        return
+
+    if not rooms:
+        await ctx.send("移行するマッチングルームは見つかりませんでした。")
+        return
+    listing = "\n".join(f"・{c.name}" for c in rooms)
+    head = (
+        f"マッチングルームを {len(rooms)} 件、スレッドに移行します。\n"
+        "移行すると、古いチャンネルは削除されます（失敗したものは残します）。2人には新しいスレッドでメンションが届きます。"
+    )
+    view = RoomMigrateView(ctx.author.id, [c.id for c in rooms])
+    if len(head) + len(listing) > 1800:
+        await ctx.send(
+            head, file=discord.File(io.BytesIO(listing.encode("utf-8")), filename="移行するルーム.txt"), view=view
+        )
+    else:
+        await ctx.send(f"{head}\n\n{listing}", view=view)
+
+
+async def _stale_history(guild: discord.Guild) -> list[dict]:
+    """マッチングルームがもう無いのに、マッチング履歴に残っている記録。"""
+    records = await asyncio.to_thread(match_records.get_all_records, True)
+    channel_pairs = set()
+    for channel in guild.text_channels:
+        if channel.category is not None and match_views._is_match_category(channel.category):
+            pair = match_views.is_private_match_room(channel)
+            if pair:
+                channel_pairs.add(frozenset(pair))
+    stale = []
+    for record in records:
+        if record["room_id"]:
+            try:
+                room = await _get_room(guild, int(record["room_id"]))
+            except ValueError:
+                room = None
+            if room is None:
+                stale.append(record)
+        elif frozenset({record["a"], record["b"]}) not in channel_pairs:
+            stale.append(record)
+    return stale
+
+
+class HistoryCleanupView(discord.ui.View):
+    def __init__(self, author_id: int):
+        super().__init__(timeout=600)
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("コマンドを打った管理者だけが押せます。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="この内容で削除する", style=discord.ButtonStyle.danger)
+    async def run(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content=interaction.message.content + "\n\n⏳ 削除しています…", view=None)
+        # 押した時点でもう一度調べ直してから消す（その間にルームが作られた場合に備える）
+        stale = await _stale_history(interaction.guild)
+        await asyncio.to_thread(match_records.remove_rows, [r["row"] for r in stale])
+        for r in stale:
+            match_store.unmark_matched(r["a"], r["b"])
+        await interaction.followup.send(f"✅ マッチング履歴から {len(stale)} 件削除しました。")
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content=interaction.message.content + "\n\n取りやめました。", view=None)
+
+
+@bot.command(name="マッチング履歴整理")
+@is_admin()
+async def cleanup_history(ctx: commands.Context):
+    """
+    マッチングルームが削除済みなのに、マッチング履歴に残っている記録を消す管理者向けコマンド。
+    （この仕組みを入れる前に、手でマッチングルームを消した場合など）
+    """
+    await ctx.send("マッチング履歴と、今あるマッチングルームを照らし合わせています…")
+    stale = await _stale_history(ctx.guild)
+    if not stale:
+        await ctx.send("消す必要のある記録はありませんでした。")
+        return
+
+    def name(member_id):
+        member = ctx.guild.get_member(int(member_id)) if member_id.isdigit() else None
+        return member.display_name if member else f"ID {member_id}"
+
+    listing = "\n".join(f"・{name(r['a'])} × {name(r['b'])}" for r in stale)
+    head = f"マッチングルームが無いのに履歴に残っている記録が {len(stale)} 件あります。消すと、会員一覧ページで「申請可能」に戻ります。"
+    view = HistoryCleanupView(ctx.author.id)
+    if len(head) + len(listing) > 1800:
+        await ctx.send(
+            head, file=discord.File(io.BytesIO(listing.encode("utf-8")), filename="消す履歴.txt"), view=view
         )
     else:
         await ctx.send(f"{head}\n\n{listing}", view=view)
@@ -1545,15 +1767,14 @@ async def run_member_archive(guild: discord.Guild, discord_id: str, display_name
 
 
 # ---------------------------------------------------------------------------
-# 退会した人がいるマッチングルームの後片付け
+# マッチングルームの後片付け
 #
-# 片方が退会したら、すぐには消さずに、残った人へメンションで知らせる。
-# ROOM_DELETE_DAYS 日後（標準は7日）に、ルームを自動で削除する。
-# 削除予定日時はチャンネルの「トピック」に書いておくので、botが再起動しても忘れない。
-# 運営がトピックから [delete_at:...] の部分を消せば、自動削除を取りやめられる。
+# - 会員が退会したら、その人が入っていたマッチングルーム（チャンネル・スレッド）をすぐに削除する
+# - マッチングルームが削除されたら（退会・管理者の手動削除のどちらでも）、マッチング履歴からも消す
+#   → 会員一覧ページで、2人とも「申請可能」に戻る
+# 以前の仕組みで「[delete_at:...]」の削除予定が書かれたチャンネルは、定期処理ですぐに削除する。
 # ---------------------------------------------------------------------------
 
-ROOM_DELETE_DAYS = float(os.getenv("ROOM_DELETE_DAYS", "7"))
 _DELETE_MARK_PREFIX = "[delete_at:"
 
 
@@ -1570,72 +1791,90 @@ def _rooms_with_member(guild: discord.Guild, member_id: int) -> list[discord.Tex
     return rooms
 
 
-def _room_delete_at(channel: discord.TextChannel) -> float | None:
-    topic = channel.topic or ""
-    start = topic.find(_DELETE_MARK_PREFIX)
-    if start < 0:
-        return None
-    end = topic.find("]", start)
+async def delete_rooms_of_member(guild: discord.Guild, member_id: int, display_name: str) -> int:
+    """退会した人が入っていたマッチングルームを削除する。削除した数を返す。"""
+    rooms = list(_rooms_with_member(guild, member_id))
     try:
-        return float(topic[start + len(_DELETE_MARK_PREFIX):end])
-    except ValueError:
-        return None
-
-
-async def schedule_room_deletion(member: discord.Member):
-    """退会した人がいたマッチングルームに、残った人あてのお知らせを出し、削除予定を書き込む。"""
-    delete_at = datetime.now(timezone.utc) + timedelta(days=ROOM_DELETE_DAYS)
-    delete_text = match_views._format_jst(delete_at.timestamp())
-    for channel in _rooms_with_member(member.guild, member.id):
-        if _room_delete_at(channel) is not None:
-            continue  # すでに削除予定（もう1人も先に退会しているなど）
-        remaining = [
-            target
-            for target, overwrite in channel.overwrites.items()
-            if isinstance(target, discord.Member)
-            and not target.bot
-            and target.id != member.id
-            and overwrite.view_channel is True
-        ]
-        mentions = " ".join(m.mention for m in remaining)
+        records = await asyncio.to_thread(match_records.rooms_for_member, str(member_id))
+    except Exception as error:  # noqa: BLE001
+        print(f"マッチング履歴の読み込みに失敗しました：{error}")
+        records = []
+    known = {room.id for room in rooms}
+    for record in records:
         try:
-            await channel.send(
-                f"{mentions}\n"
-                f"🚪 {member.display_name} さんは、リジェを退会されました。\n"
-                f"このマッチングルームは **{delete_text}** に自動で削除されます。\n"
-                "必要なやり取りや連絡先があれば、それまでに控えておいてください。",
-                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-            )
-            topic = f"🗑️ {member.display_name} さんの退会により、{delete_text} に自動で削除されます {_DELETE_MARK_PREFIX}{int(delete_at.timestamp())}]"
-            await channel.edit(topic=topic[:1024])
+            room_id = int(record["room_id"])
+        except ValueError:
+            continue
+        if room_id in known:
+            continue
+        room = await _get_room(guild, room_id)
+        if room is not None:
+            rooms.append(room)
+            known.add(room_id)
+
+    deleted = 0
+    for room in rooms:
+        try:
+            await room.delete(reason=f"{display_name} さんの退会によるマッチングルームの削除")
+            deleted += 1
         except discord.HTTPException as error:
-            print(f"「{channel.name}」に退会のお知らせを出せませんでした：{error}")
+            print(f"「{room.name}」の削除に失敗しました：{error}")
+    return deleted
 
 
-async def delete_due_rooms(guild: discord.Guild) -> int:
-    """削除予定日時を過ぎたマッチングルームを削除する（30分ごとの定期処理から呼ぶ）。"""
-    now = datetime.now(timezone.utc).timestamp()
+async def delete_marked_rooms(guild: discord.Guild) -> int:
+    """以前の仕組みで削除予定（[delete_at:...]）が書かれたマッチングルームを削除する。"""
     deleted = 0
     for channel in list(guild.text_channels):
         if channel.category is None or not match_views._is_match_category(channel.category):
             continue
-        delete_at = _room_delete_at(channel)
-        if delete_at is None or delete_at > now:
+        if _DELETE_MARK_PREFIX not in (channel.topic or ""):
             continue
         try:
-            await channel.delete(reason="退会した会員がいるマッチングルームの自動削除")
+            await channel.delete(reason="退会した会員がいるマッチングルームの削除")
             deleted += 1
         except discord.HTTPException as error:
-            print(f"「{channel.name}」の自動削除に失敗しました：{error}")
+            print(f"「{channel.name}」の削除に失敗しました：{error}")
     return deleted
+
+
+async def _forget_deleted_room(room_id: int, pair: list[str] | None):
+    """削除されたマッチングルームの記録を、マッチング履歴とメモリから消す。"""
+    try:
+        removed = await asyncio.to_thread(match_records.remove_for_deleted_room, room_id, pair)
+    except Exception as error:  # noqa: BLE001
+        print(f"マッチング履歴の削除に失敗しました（ルームID {room_id}）：{error}")
+        return
+    pairs = removed or ([pair] if pair else [])
+    for a, b in pairs:
+        match_store.unmark_matched(a, b)
+
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    """マッチングルーム（チャンネル）が削除されたら、マッチング履歴からも消す。"""
+    if not isinstance(channel, discord.TextChannel) or channel.category is None:
+        return
+    if not match_views._is_match_category(channel.category) or match_views.is_room_parent(channel):
+        return
+    pair = match_views.is_private_match_room(channel)
+    await _forget_deleted_room(channel.id, pair)
+
+
+@bot.event
+async def on_raw_thread_delete(payload: discord.RawThreadDeleteEvent):
+    """マッチングルーム（スレッド）が削除されたら、マッチング履歴からも消す。"""
+    parent = bot.get_channel(payload.parent_id)
+    if not match_views.is_room_parent(parent):
+        return
+    await _forget_deleted_room(payload.thread_id, None)
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
     """
     メンバーがサーバーからいなくなったら（キック・自主退会・BANのどれでも）、
-    入力シートの行を退会者シートへ移す。
-    その人がいたマッチングルームは、残った人に知らせてから、ROOM_DELETE_DAYS 日後に削除する。
+    その人が入っていたマッチングルームをすぐに削除し、入力シートの行を退会者シートへ移す。
     """
     if member.bot:
         return
@@ -1643,9 +1882,9 @@ async def on_member_remove(member: discord.Member):
         return  # 本番サーバー以外（テストサーバー等）では何もしない
 
     try:
-        await schedule_room_deletion(member)
+        await delete_rooms_of_member(member.guild, member.id, member.display_name)
     except Exception as error:  # noqa: BLE001 - ルームの処理に失敗しても退会処理は続ける
-        print(f"退会した人のマッチングルームの処理でエラー：{error}")
+        print(f"退会した人のマッチングルームの削除でエラー：{error}")
 
     await run_member_archive(member.guild, str(member.id), member.display_name, "サーバーから退出しました")
 
@@ -1682,14 +1921,19 @@ async def check_match_requests():
     except Exception as error:  # noqa: BLE001 - 定期処理が止まらないようにログだけ残す
         print(f"申請のリマインド・期限切れ処理でエラー：{error}")
 
-    # 退会した人がいるマッチングルームのうち、削除予定日時を過ぎたものを削除する
     guild_id = os.getenv("GUILD_ID")
     guild = bot.get_guild(int(guild_id)) if guild_id else None
     if guild is not None:
+        # 以前の仕組みで削除予定が書かれた（退会者がいる）マッチングルームを削除する
         try:
-            await delete_due_rooms(guild)
+            await delete_marked_rooms(guild)
         except Exception as error:  # noqa: BLE001
-            print(f"マッチングルームの自動削除でエラー：{error}")
+            print(f"マッチングルームの削除でエラー：{error}")
+        # マッチングルームのスレッドが、7日間の無操作で一覧から隠れないように戻す
+        try:
+            await match_views.keep_room_threads_open(guild)
+        except Exception as error:  # noqa: BLE001
+            print(f"マッチングルームのスレッドのアーカイブ解除でエラー：{error}")
 
 
 # ---------------------------------------------------------------------------
@@ -1875,12 +2119,15 @@ async def notify_match_room_message(message: discord.Message):
     if message.author.bot or message.guild is None:
         return
     channel = message.channel
-    if not isinstance(channel, discord.TextChannel) or channel.category is None:
+    if isinstance(channel, discord.Thread):
+        if not match_views.is_room_parent(channel.parent):
+            return
+    elif not isinstance(channel, discord.TextChannel) or channel.category is None:
         return
-    if not match_views._is_match_category(channel.category):
+    elif not match_views._is_match_category(channel.category):
         return
 
-    member_ids = match_views.is_private_match_room(channel)
+    member_ids = await match_views.room_pair(channel)
     if not member_ids or str(message.author.id) not in member_ids:
         return  # マッチングルームではない、または運営など2人以外の発言
 
