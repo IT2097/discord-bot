@@ -269,6 +269,11 @@ def create_app(bot, run_coro):
         if request_id is None:
             return {"ok": False, "message": "この相手にはすでに申請中です。"}, 409
 
+        created = match_store.get_request(request_id)
+        if created and created["status"] == match_store.STATUS_REJECTED:
+            # 見送られて間もない相手への申請し直し：相手には届けず、申請した人には「送信しました」と見せる
+            return {"ok": True, "message": "マッチング申請を送信しました！"}
+
         try:
             run_coro(_notify_match_request(bot, my_id, target_id, request_id))
         except Exception as error:  # noqa: BLE001
@@ -310,6 +315,11 @@ def create_app(bot, run_coro):
             if str(target_id) in match_store.matched_targets_for(my_id):
                 return {"ok": False, "state": "matched", "message": "相手がすでに承認しているため、取り消せませんでした。"}, 409
             return {"ok": False, "state": "open", "message": "取り消せる申請がありません（すでに断られたか、期限が切れています）。"}, 409
+
+        if pending_req["status"] == match_store.STATUS_REJECTED:
+            # 見送り済み（申請中に見えているだけ）の申請：相手への通知はもう無いので、記録だけ変える
+            match_store.withdraw_request(pending_req["request_id"])
+            return {"ok": True, "state": "open", "message": "マッチング申請を取り消しました。"}
 
         # 先に「取消」にしておくことで、削除中に相手が承認ボタンを押しても承認されないようにする
         if match_store.resolve_request(pending_req["request_id"], match_store.STATUS_CANCELLED) is None:
