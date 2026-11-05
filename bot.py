@@ -30,7 +30,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-11-05 マッチングルームのスレッド化（テスト）版"
+BOT_VERSION = "2026-11-06 マッチングルームのスレッド化（全員）版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 # 会員一覧ページ（マッチング申請ページ）のURLを投稿するチャンネル（以前の名前は「マッチングルーム」）

@@ -80,14 +80,14 @@ def is_private_match_room(channel: discord.TextChannel) -> list[str] | None:
 # チャンネルは1サーバー500個までなので、マッチングルームを「マッチングルーム」チャンネルの中の
 # プライベートスレッドとして作る（スレッドはチャンネル数に入らない）。
 # MATCH_ROOM_MODE で切り替える：
-#   admin … 2人のどちらかが管理者のときだけスレッド（テスト用。標準）
-#   all   … すべてスレッド
+#   admin … 2人のどちらかが管理者のときだけスレッド（テスト用）
+#   all   … すべてスレッド（標準）
 #   off   … すべて今までどおりチャンネル
 # どのスレッドが誰のルームかは、マッチング履歴シートの「ルームID」で管理する。
 # ---------------------------------------------------------------------------
 
 MATCH_ROOM_CHANNEL_NAME = os.getenv("MATCH_ROOM_CHANNEL_NAME", "マッチングルーム")
-MATCH_ROOM_MODE = os.getenv("MATCH_ROOM_MODE", "admin").strip().lower()
+MATCH_ROOM_MODE = os.getenv("MATCH_ROOM_MODE", "all").strip().lower()
 ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "管理者")
 
 # 「マッチングルーム」チャンネルでbotに必要な権限（スレッドを作る・アーカイブを戻す・移行で書き写す）
@@ -168,15 +168,29 @@ async def setup_room_parent(guild: discord.Guild, member_role: discord.Role | No
 
 
 async def _post_room_intro(room, member_a: discord.Member, member_b: discord.Member):
-    await room.send(f"{member_a.mention} と {member_b.mention} のマッチングルームです！")
-    # お互いのプロフィール（スプレッドシートの情報）を1通ずつ投稿する
+    """
+    ルームの最初のメッセージ。2人へのメンションは、この1回だけにする。
+    お互いのプロフィールを、区切り線で分けて続けて載せる。
+    """
+    profiles = []
     for member in (member_a, member_b):
         try:
             profile = await asyncio.to_thread(sheets_client.find_member, str(member.id))
         except Exception:  # noqa: BLE001 - シート取得に失敗してもルーム作成自体は継続する
             profile = None
         if profile:
-            await room.send(_format_profile(profile))
+            profiles.append(_format_profile(profile))
+
+    head = f"{member_a.mention} と {member_b.mention} のマッチングルームです！"
+    blocks = [f"{PROFILE_DIVIDER}\n{text}" for text in profiles]
+    whole = "\n\n".join([head, *blocks])
+    if len(whole) <= 1900:
+        await room.send(whole)
+        return
+    # 長すぎるときは、メンションは最初の1通だけにして、プロフィールは1人ずつ送る
+    await room.send(head)
+    for block in blocks:
+        await room.send(block[:1990], allowed_mentions=discord.AllowedMentions.none())
 
 
 async def create_match_thread(
@@ -192,10 +206,20 @@ async def create_match_thread(
         invitable=False,
         auto_archive_duration=10080,  # 7日（さらに、botが定期的にアーカイブを戻して一覧から隠れないようにする）
     )
-    await thread.add_user(member_a)
-    await thread.add_user(member_b)
     if intro:
+        # 最初のメッセージでメンションすると2人がスレッドに入るので、
+        # 「〇〇が追加されました」の通知とメンションの2回の通知にならないよう、追加はメンションに任せる
         await _post_room_intro(thread, member_a, member_b)
+        try:
+            joined = {m.id for m in await thread.fetch_members()}
+        except discord.HTTPException:
+            joined = set()
+        for member in (member_a, member_b):
+            if member.id not in joined:
+                await thread.add_user(member)  # メンションで入らなかったときだけ追加する
+    else:
+        await thread.add_user(member_a)
+        await thread.add_user(member_b)
     return thread
 
 
@@ -365,7 +389,6 @@ async def migrate_room_channel(channel: discord.TextChannel) -> tuple[discord.Th
 
     await thread.send(
         "── ここまでが、移す前のやり取りです ──\n"
-        f"{members[0].mention} {members[1].mention}\n"
         "マッチングルームを、このスレッドに移しました。これからはこちらでやり取りしてください。"
     )
 
@@ -390,57 +413,58 @@ def _location_lines(member: dict) -> list[str]:
     return ["地域："] + [f"　{i + 1}. {loc['prefecture']}{loc['city']}" for i, loc in enumerate(locations)]
 
 
-def _format_profile(member: dict) -> str:
-    """
-    スプレッドシートのプロフィール情報（名前・年齢・性別・都道府県・市町村・
-    業種・事業/活動内容）を、DMやチャンネル投稿用のテキストに整形する。
-    マッチング成立時に自動投稿するプロフィール用（A〜H列相当のみ）。
-    """
-    lines = [f"📇 {member['name']} さんのプロフィールです"]
+_CIRCLED_NUMBERS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+PROFILE_DIVIDER = "━━━━━━━━━━━━━━"
 
+
+def _business_lines(member: dict) -> list[str]:
+    """業種と事業/活動内容の行。複数あるときは「業種①」「業種②」…と番号を付ける。"""
+    businesses = [b for b in member.get("businesses", []) if b.get("type") or b.get("content")]
+    lines = []
+    for index, biz in enumerate(businesses):
+        number = "" if len(businesses) == 1 else (
+            _CIRCLED_NUMBERS[index] if index < len(_CIRCLED_NUMBERS) else f"({index + 1})"
+        )
+        if index > 0:
+            lines.append("")  # 業種ごとに1行あけて見やすくする
+        lines.append(f"業種{number}：{biz.get('type') or '（未入力）'}")
+        if biz.get("content"):
+            lines.append(f"　事業/活動内容{number}：{biz['content']}")
+    return lines
+
+
+def _profile_body(member: dict) -> list[str]:
+    lines = [f"📇 **{member['name']}** さんのプロフィール"]
     if member.get("age"):
         lines.append(f"年齢：{member['age']}")
     if member.get("gender"):
         lines.append(f"性別：{member['gender']}")
     lines.extend(_location_lines(member))
+    business = _business_lines(member)
+    if business:
+        lines.append("")
+        lines.extend(business)
+    return lines
 
-    for biz in member.get("businesses", []):
-        biz_type = biz.get("type", "")
-        biz_content = biz.get("content", "")
-        if biz_type:
-            lines.append(f"業種：{biz_type}")
-        if biz_content:
-            lines.append(f"事業/活動内容：{biz_content}")
 
-    return "\n".join(lines)
+def _format_profile(member: dict) -> str:
+    """
+    スプレッドシートのプロフィール情報（名前・年齢・性別・地域・業種・事業/活動内容）を、
+    マッチングルームに投稿するテキストに整形する。
+    """
+    return "\n".join(_profile_body(member))
 
 
 def _format_full_profile(member: dict) -> str:
     """
-    マッチング会員一覧（Webページ）に表示されているのと同じ情報一式
-    （年齢・性別・都道府県・市町村・業種・事業内容・URL）を整形する。
-    承認チャンネルの「プロフィール」ボタンの表示用。
+    マッチング会員一覧（Webページ）に表示されているのと同じ情報一式を整形する。
+    承認スレッドの「プロフィール」ボタンの表示用。
     """
-    lines = [f"📇 {member['name']} さんのプロフィールです"]
-
-    if member.get("age"):
-        lines.append(f"年齢：{member['age']}")
-    if member.get("gender"):
-        lines.append(f"性別：{member['gender']}")
-    lines.extend(_location_lines(member))
-
-    for biz in member.get("businesses", []):
-        biz_type = biz.get("type", "")
-        biz_content = biz.get("content", "")
-        if biz_type:
-            lines.append(f"業種：{biz_type}")
-        if biz_content:
-            lines.append(f"事業/活動内容：{biz_content}")
-
+    lines = _profile_body(member)
     if member.get("urls"):
+        lines.append("")
         lines.append("URL：")
         lines.extend(member["urls"])
-
     return "\n".join(lines)
 
 
@@ -478,17 +502,7 @@ async def create_match_channel(
         category=category,
     )
 
-    await channel.send(f"{member_a.mention} と {member_b.mention} のマッチングルームです！")
-
-    # お互いのプロフィール（スプレッドシートの情報）を1通ずつ投稿する
-    for member in (member_a, member_b):
-        try:
-            profile = sheets_client.find_member(str(member.id))
-        except Exception:  # noqa: BLE001 - シート取得に失敗してもルーム作成自体は継続する
-            profile = None
-        if profile:
-            await channel.send(_format_profile(profile))
-
+    await _post_room_intro(channel, member_a, member_b)
     return channel
 
 
@@ -714,7 +728,8 @@ async def _handle_reject(interaction: discord.Interaction, request_id: str):
         return
     try:
         requester = await guild.fetch_member(int(request["requester_id"]))
-        await requester.send("残念ながら、マッチング申請は今回見送られました。")
+        target_name = getattr(interaction.user, "display_name", None) or "相手"
+        await requester.send(f"残念ながら、{target_name} さんへのマッチング申請は今回見送られました。")
     except (discord.NotFound, discord.Forbidden):
         pass
 
