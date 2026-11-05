@@ -800,6 +800,65 @@ async def _all_room_threads(guild: discord.Guild) -> list[discord.Thread]:
     return threads
 
 
+async def _departed_rooms(guild: discord.Guild) -> list[tuple[discord.TextChannel, list[str]]]:
+    """
+    マッチングルームのカテゴリにあるチャンネルのうち、個別に権限が付いている人の中に
+    すでにサーバーにいない（退会した）人がいるもの。戻り値は (チャンネル, 退会した人のIDのリスト)。
+    """
+    rooms = []
+    for channel in guild.text_channels:
+        if channel.category is None or not match_views._is_match_category(channel.category):
+            continue
+        if match_views.is_room_parent(channel):
+            continue
+        departed = []
+        for target, overwrite in channel.overwrites.items():
+            if isinstance(target, discord.Role) or overwrite.view_channel is not True or target.id == guild.me.id:
+                continue
+            if guild.get_member(target.id) is not None:
+                continue
+            # botの手元に情報が無いだけの可能性もあるので、Discordに問い合わせて本当にいないか確かめる
+            try:
+                await guild.fetch_member(target.id)
+                continue
+            except discord.NotFound:
+                departed.append(str(target.id))
+            except discord.HTTPException:
+                continue  # 確かめられないときは、消さない側に倒す
+        if departed:
+            rooms.append((channel, departed))
+    return rooms
+
+
+@bot.command(name="退会者ルーム削除")
+@is_admin()
+async def delete_departed_rooms(ctx: commands.Context):
+    """
+    退会した人が入っているマッチングルーム（チャンネル）をまとめて削除する管理者向けコマンド。
+    （退会者がいるため !ルーム移行 で移せなかったチャンネルの片付け用。スレッドは対象外）
+    まず対象の一覧を出し、ボタンを押したときだけ削除する。
+    """
+    await ctx.send("退会した人が入っているマッチングルームを探しています…")
+    rooms = await _departed_rooms(ctx.guild)
+    if not rooms:
+        await ctx.send("退会した人が入っているマッチングルームのチャンネルは見つかりませんでした。")
+        return
+    listing = "\n".join(f"・{channel.name}" for channel, _ in rooms)
+    head = (
+        f"退会した人が入っているマッチングルームが {len(rooms)} 件あります。\n"
+        "削除したチャンネルは元に戻せません。内容を確認して、ボタンを押してください。"
+    )
+    view = RoomBulkDeleteView(ctx.author.id, [channel.id for channel, _ in rooms])
+    if len(head) + len(listing) > 1800:
+        await ctx.send(
+            head + "\n（一覧が長いのでファイルにしました）",
+            file=discord.File(io.BytesIO(listing.encode("utf-8")), filename="削除するルーム.txt"),
+            view=view,
+        )
+    else:
+        await ctx.send(f"{head}\n\n{listing}", view=view)
+
+
 @bot.command(name="ルーム一括削除")
 @is_admin()
 async def bulk_delete_rooms(ctx: commands.Context, *, keyword: str):
