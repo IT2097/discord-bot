@@ -800,10 +800,12 @@ async def _all_room_threads(guild: discord.Guild) -> list[discord.Thread]:
     return threads
 
 
-async def _departed_rooms(guild: discord.Guild) -> list[tuple[discord.TextChannel, list[str]]]:
+async def _departed_rooms(guild: discord.Guild) -> list[tuple[discord.TextChannel, int]]:
     """
-    マッチングルームのカテゴリにあるチャンネルのうち、個別に権限が付いている人の中に
-    すでにサーバーにいない（退会した）人がいるもの。戻り値は (チャンネル, 退会した人のIDのリスト)。
+    マッチングルームのカテゴリにあるチャンネルのうち、入れる会員（個別に権限が付いていて、
+    今もサーバーにいる人。botは除く）が1人以下のもの＝相手が退会したルーム。
+    退会すると、その人の権限の設定ごと消えることがあるため、「残っている人数」で判断する。
+    戻り値は (チャンネル, 残っている会員の人数)。
     """
     rooms = []
     for channel in guild.text_channels:
@@ -811,22 +813,26 @@ async def _departed_rooms(guild: discord.Guild) -> list[tuple[discord.TextChanne
             continue
         if match_views.is_room_parent(channel):
             continue
-        departed = []
+        present = 0
         for target, overwrite in channel.overwrites.items():
-            if isinstance(target, discord.Role) or overwrite.view_channel is not True or target.id == guild.me.id:
+            if isinstance(target, discord.Role) or overwrite.view_channel is not True:
                 continue
-            if guild.get_member(target.id) is not None:
+            if target.id == guild.me.id or getattr(target, "bot", False):
                 continue
-            # botの手元に情報が無いだけの可能性もあるので、Discordに問い合わせて本当にいないか確かめる
-            try:
-                await guild.fetch_member(target.id)
-                continue
-            except discord.NotFound:
-                departed.append(str(target.id))
-            except discord.HTTPException:
-                continue  # 確かめられないときは、消さない側に倒す
-        if departed:
-            rooms.append((channel, departed))
+            member = guild.get_member(target.id)
+            if member is None:
+                # botの手元に情報が無いだけの可能性もあるので、Discordに問い合わせて確かめる
+                try:
+                    member = await guild.fetch_member(target.id)
+                except discord.NotFound:
+                    member = None
+                except discord.HTTPException:
+                    present += 1  # 確かめられないときは「いる」とみなして、消さない側に倒す
+                    continue
+            if member is not None and not member.bot:
+                present += 1
+        if present <= 1:
+            rooms.append((channel, present))
     return rooms
 
 
@@ -834,18 +840,18 @@ async def _departed_rooms(guild: discord.Guild) -> list[tuple[discord.TextChanne
 @is_admin()
 async def delete_departed_rooms(ctx: commands.Context):
     """
-    退会した人が入っているマッチングルーム（チャンネル）をまとめて削除する管理者向けコマンド。
+    相手が退会して、入れる会員が1人以下になったマッチングルーム（チャンネル）をまとめて削除する管理者向けコマンド。
     （退会者がいるため !ルーム移行 で移せなかったチャンネルの片付け用。スレッドは対象外）
     まず対象の一覧を出し、ボタンを押したときだけ削除する。
     """
-    await ctx.send("退会した人が入っているマッチングルームを探しています…")
+    await ctx.send("相手が退会したマッチングルームを探しています…")
     rooms = await _departed_rooms(ctx.guild)
     if not rooms:
-        await ctx.send("退会した人が入っているマッチングルームのチャンネルは見つかりませんでした。")
+        await ctx.send("入れる会員が1人以下になっているマッチングルームのチャンネルは見つかりませんでした。")
         return
-    listing = "\n".join(f"・{channel.name}" for channel, _ in rooms)
+    listing = "\n".join(f"・{channel.name}（残っている会員：{count}人）" for channel, count in rooms)
     head = (
-        f"退会した人が入っているマッチングルームが {len(rooms)} 件あります。\n"
+        f"相手が退会して、入れる会員が1人以下になっているマッチングルームが {len(rooms)} 件あります。\n"
         "削除したチャンネルは元に戻せません。内容を確認して、ボタンを押してください。"
     )
     view = RoomBulkDeleteView(ctx.author.id, [channel.id for channel, _ in rooms])
