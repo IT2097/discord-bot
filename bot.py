@@ -33,7 +33,8 @@ bot_loop: asyncio.AbstractEventLoop | None = None
 BOT_VERSION = "2026-11-05 マッチングルームのスレッド化（テスト）版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
-MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチングルーム")
+# 会員一覧ページ（マッチング申請ページ）のURLを投稿するチャンネル（以前の名前は「マッチングルーム」）
+MATCHING_ROOM_CHANNEL_NAME = os.getenv("MATCHING_ROOM_CHANNEL_NAME", "マッチング申請")
 WEB_APP_URL = os.getenv("WEB_APP_URL")
 
 # 新規メンバー参加時に「id同期」の結果を投稿するチャンネル名
@@ -2165,7 +2166,7 @@ async def notify_match_room_message(message: discord.Message):
 
 async def post_matching_room_link():
     """
-    「マッチングルーム」チャンネルに、会員情報確認・マッチング申請ページの
+    「マッチング申請」チャンネル（MATCHING_ROOM_CHANNEL_NAME）に、会員情報確認・マッチング申請ページの
     固定URLを投稿する。すでに投稿済み（直近の履歴にBot自身の同じURL投稿がある）
     場合は再投稿しない（Railway再起動のたびにスパムしないため）。
     """
@@ -2180,7 +2181,15 @@ async def post_matching_room_link():
         print("マッチングルームへの投稿に失敗：Botが指定サーバーに参加していません。")
         return
 
-    channel = discord.utils.get(guild.text_channels, name=MATCHING_ROOM_CHANNEL_NAME)
+    # スレッド方式のマッチングルームの親チャンネル（同じ名前になり得る）には投稿しない
+    channel = next(
+        (
+            c
+            for c in guild.text_channels
+            if c.name == MATCHING_ROOM_CHANNEL_NAME and not match_views.is_room_parent(c)
+        ),
+        None,
+    )
     if channel is None:
         print(f"「{MATCHING_ROOM_CHANNEL_NAME}」という名前のテキストチャンネルが見つかりませんでした。")
         return
