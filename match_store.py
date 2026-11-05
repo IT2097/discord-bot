@@ -42,7 +42,13 @@ STATUS_EXPIRED = "期限切れ"
 STATUS_CANCELLED = "取消"
 
 REQUEST_SHEET_NAME = os.getenv("MATCH_REQUEST_SHEET_NAME", "マッチング申請")
-_HEADERS = ["申請ID", "申請者DiscordID", "相手DiscordID", "申請日時", "状態", "チャンネルID", "メッセージID", "リマインド済み"]
+_HEADERS = ["申請ID", "申請者DiscordID", "相手DiscordID", "申請日時", "状態", "チャンネルID", "メッセージID", "リマインド済み", "確定日時"]
+
+# 断られた申請は、申請した人には知らせず、この日数のあいだ「申請中」のまま見せる（そのあと「申請可能」に戻る）。
+# その間に申請し直しても、相手には届かない（気まずくならないようにするため）。
+REJECT_HIDE_SECONDS = float(os.getenv("REJECT_HIDE_DAYS", "30")) * 24 * 60 * 60
+# 「申請中」に見えている見送り済みの申請を、申請した人が取り消したときの状態
+STATUS_REJECTED_WITHDRAWN = "拒否（取消済み）"
 
 # 日本時間（サーバーのタイムゾーン設定に左右されないよう固定で+9時間）
 _JST = timezone(timedelta(hours=9))
@@ -90,7 +96,14 @@ def _open_sheet():
 
 def _get_sheet():
     if _sheet_cache["sheet"] is None:
-        _sheet_cache["sheet"] = _with_retry(_open_sheet)
+        sheet = _with_retry(_open_sheet)
+        # 以前からあるシートには「確定日時」（I列）の見出しが無いので足しておく
+        header = _with_retry(sheet.row_values, 1)
+        if len(header) < len(_HEADERS) or not str(header[len(_HEADERS) - 1]).strip():
+            if sheet.col_count < len(_HEADERS):
+                _with_retry(sheet.add_cols, len(_HEADERS) - sheet.col_count)
+            _with_retry(sheet.update, range_name="I1", values=[[_HEADERS[-1]]])
+        _sheet_cache["sheet"] = sheet
     return _sheet_cache["sheet"]
 
 
@@ -125,6 +138,7 @@ def _load_locked():
             "channel_id": row[5].strip(),
             "message_id": row[6].strip(),
             "reminded": row[7].strip().upper() == "TRUE",
+            "resolved_at": _parse_time(row[8]) if row[8].strip() else 0.0,
         }
     _requests = loaded
 
@@ -149,13 +163,19 @@ def _save_locked(request_id: str):
         req = _requests.get(request_id)
         if req is None:
             return  # シートから行ごと消されていた
-        for key in ("status", "channel_id", "message_id", "reminded"):
+        for key in ("status", "channel_id", "message_id", "reminded", "resolved_at"):
             req[key] = saved[key]
 
     _with_retry(
         sheet.update,
-        range_name=f"E{req['row']}:H{req['row']}",
-        values=[[req["status"], req["channel_id"], req["message_id"], "TRUE" if req["reminded"] else ""]],
+        range_name=f"E{req['row']}:I{req['row']}",
+        values=[[
+            req["status"],
+            req["channel_id"],
+            req["message_id"],
+            "TRUE" if req["reminded"] else "",
+            _format_time(req["resolved_at"]) if req.get("resolved_at") else "",
+        ]],
         value_input_option="RAW",
     )
 
@@ -185,13 +205,29 @@ def preload():
         _ensure_loaded_locked()
 
 
+def _recent_rejection(req: dict, now: float | None = None) -> bool:
+    """見送られてから REJECT_HIDE_SECONDS 以内の申請か（取り消し済みのものも含む）。"""
+    now = time.time() if now is None else now
+    return (
+        req["status"] in (STATUS_REJECTED, STATUS_REJECTED_WITHDRAWN)
+        and req.get("resolved_at", 0) > 0
+        and now - req["resolved_at"] < REJECT_HIDE_SECONDS
+    )
+
+
+def _looks_pending(req: dict, now: float | None = None) -> bool:
+    """申請した人から見て「申請中」に見える申請（承認待ち、または見送られて間もないもの）。"""
+    status = _effective_status(req, now)
+    return status == STATUS_PENDING or (status == STATUS_REJECTED and _recent_rejection(req, now))
+
+
 def has_pending_request(requester_id: str, target_id: str) -> bool:
     with _lock:
         _ensure_loaded_locked()
         return any(
             req["requester_id"] == str(requester_id)
             and req["target_id"] == str(target_id)
-            and _effective_status(req) == STATUS_PENDING
+            and _looks_pending(req)
             for req in _requests.values()
         )
 
@@ -199,8 +235,9 @@ def has_pending_request(requester_id: str, target_id: str) -> bool:
 def create_request(requester_id: str, target_id: str) -> str | None:
     """
     新しいマッチング申請を作成してシートに記録する。
-    同じ相手への申請が承認待ち（7日以内）の場合は None を返す（重複防止）。
-    期限切れ・拒否済みの相手には、もう一度申請できる。
+    同じ相手への申請が「申請中」に見えている場合は None を返す（重複防止）。
+    見送られて間もない相手への申請は、状態「拒否」で記録する（相手には届けない）。
+    作った申請の状態は get_request で確かめられる（「拒否」なら相手に通知しないこと）。
     """
     with _lock:
         _ensure_loaded_locked()
@@ -209,7 +246,21 @@ def create_request(requester_id: str, target_id: str) -> str | None:
 
         request_id = uuid.uuid4().hex
         now = time.time()
-        row_values = [request_id, str(requester_id), str(target_id), _format_time(now), STATUS_PENDING, "", "", ""]
+
+        # 見送られて間もない相手に申請し直した場合は、相手には届けず「見送り済み」として記録する
+        # （申請した人の画面では「申請中」に見える。見送られた日から REJECT_HIDE_SECONDS たてば申請できる）
+        recent = [
+            r["resolved_at"]
+            for r in _requests.values()
+            if r["requester_id"] == str(requester_id) and r["target_id"] == str(target_id) and _recent_rejection(r, now)
+        ]
+        status = STATUS_REJECTED if recent else STATUS_PENDING
+        resolved_at = max(recent) if recent else 0.0
+
+        row_values = [
+            request_id, str(requester_id), str(target_id), _format_time(now), status, "", "", "",
+            _format_time(resolved_at) if resolved_at else "",
+        ]
         response = _with_retry(
             _get_sheet().append_rows, [row_values], value_input_option="RAW", table_range="A1"
         )
@@ -224,10 +275,11 @@ def create_request(requester_id: str, target_id: str) -> str | None:
                 "requester_id": str(requester_id),
                 "target_id": str(target_id),
                 "created_at": now,
-                "status": STATUS_PENDING,
+                "status": status,
                 "channel_id": "",
                 "message_id": "",
                 "reminded": False,
+                "resolved_at": resolved_at,
             }
         else:
             _load_locked()
@@ -268,19 +320,42 @@ def resolve_request(request_id: str, status: str = STATUS_CANCELLED) -> dict | N
         if req is None or _effective_status(req) != STATUS_PENDING:
             return None
         req["status"] = status
+        req["resolved_at"] = time.time()
         _save_locked(request_id)
         return _public(req)
 
 
+def withdraw_request(request_id: str) -> bool:
+    """
+    申請した人が「申請を取り消す」を押したときの処理。
+    承認待ちなら「取消」にする。見送られて間もない（申請中に見えている）申請なら「拒否（取消済み）」にする。
+    どちらでもなければ False。
+    """
+    with _lock:
+        _ensure_loaded_locked()
+        req = _requests.get(request_id)
+        if req is None:
+            return False
+        if _effective_status(req) == STATUS_PENDING:
+            req["status"] = STATUS_CANCELLED
+            req["resolved_at"] = time.time()
+        elif req["status"] == STATUS_REJECTED and _recent_rejection(req):
+            req["status"] = STATUS_REJECTED_WITHDRAWN  # 見送られた日（確定日時）はそのまま残す
+        else:
+            return False
+        _save_locked(request_id)
+        return True
+
+
 def find_pending_request(requester_id: str, target_id: str) -> dict | None:
-    """申請者→相手の、承認待ち中の申請を1件返す（なければ None）。取り消しボタン用。"""
+    """申請者→相手の、「申請中」に見えている申請を1件返す（なければ None）。取り消しボタン用。"""
     with _lock:
         _ensure_loaded_locked()
         for req in _requests.values():
             if (
                 req["requester_id"] == str(requester_id)
                 and req["target_id"] == str(target_id)
-                and _effective_status(req) == STATUS_PENDING
+                and _looks_pending(req)
             ):
                 return _public(req)
         return None
@@ -293,7 +368,7 @@ def pending_targets_for(requester_id: str) -> set[str]:
         return {
             req["target_id"]
             for req in _requests.values()
-            if req["requester_id"] == str(requester_id) and _effective_status(req) == STATUS_PENDING
+            if req["requester_id"] == str(requester_id) and _looks_pending(req)
         }
 
 

@@ -719,19 +719,10 @@ async def _handle_reject(interaction: discord.Interaction, request_id: str):
         await interaction.followup.send(_DONE_TEXT, ephemeral=True)
         return
     await _close_request_message(interaction.message, "見送りになりました")
-    await interaction.followup.send("申請を断りました。", ephemeral=True)
+    await interaction.followup.send("申請を断りました。相手には通知されません。", ephemeral=True)
     if _is_request_thread(interaction.message):
         await _remove_request_thread(interaction.message, None, 0)  # 断ったら申請スレッドはすぐに消す
-
-    guild = interaction.guild
-    if guild is None:
-        return
-    try:
-        requester = await guild.fetch_member(int(request["requester_id"]))
-        target_name = getattr(interaction.user, "display_name", None) or "相手"
-        await requester.send(f"残念ながら、{target_name} さんへのマッチング申請は今回見送られました。")
-    except (discord.NotFound, discord.Forbidden):
-        pass
+    # 申請した人には知らせない（気まずくならないよう、しばらく「申請中」のまま見せる。match_store を参照）
 
 
 async def _handle_profile(interaction: discord.Interaction, request_id: str):
