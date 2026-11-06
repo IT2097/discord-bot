@@ -30,7 +30,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-11-06 マッチングルームのスレッド化（全員）版"
+BOT_VERSION = "2026-11-06 投稿制限・マッチングルーム案内版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 # 会員一覧ページ（マッチング申請ページ）のURLを投稿するチャンネル（以前の名前は「マッチングルーム」）
@@ -529,7 +529,10 @@ async def setup_member_role(ctx: commands.Context):
             # Bot自身も見えなくなり、承認メッセージの投稿などが403エラーになるのを防ぐ）
             await channel.set_permissions(ctx.guild.me, **BOT_CHANNEL_PERMISSIONS)
             await channel.set_permissions(ctx.guild.default_role, view_channel=False)
-            await channel.set_permissions(role, view_channel=True)
+            # 投稿制限など、ほかの設定を消さないよう、閲覧の許可だけを足す
+            role_overwrite = channel.overwrites_for(role)
+            role_overwrite.view_channel = True
+            await channel.set_permissions(role, overwrite=role_overwrite)
             count += 1
         except discord.HTTPException:
             failed += 1
@@ -910,6 +913,122 @@ async def bulk_delete_rooms(ctx: commands.Context, *, keyword: str):
         await ctx.send(f"{head}\n\n{listing}", view=view)
 
 
+ROOM_GUIDE_MARK = "📌 **マッチングルームの使い方**"
+
+
+async def _post_room_guide(channel: discord.TextChannel):
+    """「マッチングルーム」チャンネルに使い方の案内を投稿する（すでにあれば書き換える）。"""
+    apply_channel = next(
+        (c for c in channel.guild.text_channels if c.name == MATCHING_ROOM_CHANNEL_NAME and not match_views.is_room_parent(c)),
+        None,
+    )
+    apply_text = apply_channel.mention if apply_channel else f"#{MATCHING_ROOM_CHANNEL_NAME}"
+    text = (
+        f"{ROOM_GUIDE_MARK}\n"
+        "マッチングが成立すると、このチャンネルの中に**2人だけのスレッド**が作られます。\n\n"
+        "**🔍 自分のマッチングルームの探し方**\n"
+        "・パソコン：右上のスレッドのマーク（🧵）から一覧を開く\n"
+        "・スマホ：チャンネル名をタップすると、スレッドの一覧が出ます\n\n"
+        "**📝 知っておいてほしいこと**\n"
+        "・スレッドは、マッチングした2人にだけ表示されます\n"
+        "・相手からメッセージが届くと、DMでお知らせが届きます\n"
+        "・このチャンネル自体には書き込めません。やり取りは各スレッドの中でどうぞ\n\n"
+        f"気になる会員へのマッチング申請は、{apply_text} のページからできます。"
+    )
+    async for message in channel.history(limit=50):
+        if message.author.id == channel.guild.me.id and message.content.startswith(ROOM_GUIDE_MARK):
+            if message.content != text:
+                await message.edit(content=text)
+            return
+    message = await channel.send(text)
+    try:
+        await message.pin()
+    except discord.HTTPException:
+        pass
+
+
+def _read_only_channel_names() -> list[str]:
+    """会員が直接書き込めないようにするチャンネル（カンマ区切りで環境変数 READ_ONLY_CHANNEL_NAMES から変更できる）。"""
+    default = ",".join([
+        match_views.MATCH_ROOM_CHANNEL_NAME,
+        MATCHING_ROOM_CHANNEL_NAME,
+        match_views.APPROVAL_CHANNEL_NAME,
+        "お知らせ",
+        PROFILE_EDIT_CHANNEL_NAME,
+        inquiry.INQUIRY_CHANNEL_NAME,
+    ])
+    return [name.strip() for name in os.getenv("READ_ONLY_CHANNEL_NAMES", default).split(",") if name.strip()]
+
+
+def _thread_reply_channel_names() -> set[str]:
+    """チャンネルには書き込めないが、中のスレッド（自分のマッチングルーム・自分の問い合わせ）では発言できるチャンネル。"""
+    return {match_views.MATCH_ROOM_CHANNEL_NAME, inquiry.INQUIRY_CHANNEL_NAME}
+
+
+@bot.command(name="投稿制限設定")
+@is_admin()
+async def setup_read_only_channels(ctx: commands.Context):
+    """
+    マッチングルーム・マッチング申請・承認・お知らせ・プロフィール編集・問い合わせのチャンネルに、
+    会員がメッセージを書き込めない制限を付ける管理者向けコマンド（見える・見えないの設定は変えない）。
+    マッチングルームと問い合わせは、自分が入っているスレッドの中でだけ発言できるようにする。
+    """
+    targets = [
+        role
+        for role in (
+            ctx.guild.default_role,
+            discord.utils.get(ctx.guild.roles, name=MEMBER_ROLE_NAME),
+            discord.utils.get(ctx.guild.roles, name=UNVERIFIED_ROLE_NAME),
+        )
+        if role is not None
+    ]
+    done, missing, warnings = [], [], []
+    for name in _read_only_channel_names():
+        channels = [c for c in ctx.guild.text_channels if c.name == name]
+        if not channels:
+            missing.append(name)
+            continue
+        thread_reply = name in _thread_reply_channel_names()
+        for channel in channels:
+            try:
+                # bot自身は書き込めるようにしておく
+                bot_overwrite = channel.overwrites_for(ctx.guild.me)
+                bot_overwrite.update(
+                    view_channel=True, send_messages=True, send_messages_in_threads=True, read_message_history=True
+                )
+                await channel.set_permissions(ctx.guild.me, overwrite=bot_overwrite)
+                for role in targets:
+                    overwrite = channel.overwrites_for(role)
+                    overwrite.update(
+                        send_messages=False,
+                        create_public_threads=False,
+                        create_private_threads=False,
+                        send_messages_in_threads=True if thread_reply else False,
+                    )
+                    await channel.set_permissions(role, overwrite=overwrite)
+                done.append(channel.mention)
+            except discord.HTTPException as error:
+                warnings.append(f"・{channel.mention}：設定できませんでした（{error}）")
+                continue
+            # ほかのロールで書き込みを許可していると、そちらが優先されるので知らせる
+            allowed = [
+                target.name
+                for target, ow in channel.overwrites.items()
+                if isinstance(target, discord.Role) and target not in targets and ow.send_messages is True
+                and not target.permissions.administrator and target != ctx.guild.me.top_role
+            ]
+            if allowed:
+                warnings.append(f"・{channel.mention}：「{'」「'.join(allowed)}」ロールには書き込みが許可されたままです")
+
+    message = "✅ 会員が書き込めないように設定しました：" + ("、".join(done) if done else "なし")
+    message += "\n（マッチングルーム・問い合わせは、自分のスレッドの中では発言できます）"
+    if missing:
+        message += "\n⚠️ 見つからなかったチャンネル：" + "、".join(missing)
+    if warnings:
+        message += "\n" + "\n".join(warnings)
+    await ctx.send(message[:1900])
+
+
 @bot.command(name="マッチングルーム設定")
 @is_admin()
 async def setup_room_parent_command(ctx: commands.Context):
@@ -926,6 +1045,10 @@ async def setup_room_parent_command(ctx: commands.Context):
     except (RuntimeError, discord.HTTPException) as error:
         await ctx.send(f"設定できませんでした：{error}")
         return
+    try:
+        await _post_room_guide(channel)
+    except discord.HTTPException as error:
+        await ctx.send(f"⚠️ 使い方の案内を投稿できませんでした：{error}")
     mode = {
         "admin": "テスト中：どちらかが管理者のマッチングだけスレッドで作ります",
         "all": "すべてのマッチングをスレッドで作ります",
