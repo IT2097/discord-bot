@@ -1241,52 +1241,41 @@ async def cleanup_history(ctx: commands.Context):
 @is_admin()
 async def setup_forum_requests(ctx: commands.Context):
     """
-    コミュニティのフォーラムに新しい枠（投稿）を作るときの「リクエスト→承認」の仕組みを設定する管理者向けコマンド。
-    打ったチャンネルに「📝 新しい枠をリクエスト」ボタンを置く（チャンネル紹介で打つ想定）。
-    あわせて、
-    - コミュニティのフォーラムで、会員が直接新しい投稿を作れないようにする（返信はできる）
-    - 管理者だけが見られる「投稿リクエスト」チャンネルが無ければ作る
+    作成リクエストのボタンを、打ったチャンネルに置く管理者向けコマンド。
+    打ったチャンネルのカテゴリで、置くボタンが変わる。
+      「コミュニティ」カテゴリ   … 趣味・在宅ワークなどのフォーラムに「枠」（投稿）を作るリクエスト
+      「発信チャンネル」カテゴリ … 主が発信する新しいフォーラムチャンネルを作るリクエスト
+    あわせて、そのカテゴリのフォーラムで、会員が直接新しい投稿を作れないようにする（返信はできる。主はこれまでどおり投稿できる）。
     """
+    kind = forum_request.kind_for_category(ctx.channel.category)
+    if kind is None:
+        await ctx.send(
+            f"「{forum_request.COMMUNITY_CATEGORY_NAME}」か「{forum_request.OWNER_FORUM_CATEGORY_NAME}」カテゴリの中のチャンネルで打ってください。"
+        )
+        return
     try:
         await ctx.message.delete()
     except discord.HTTPException:
         pass
-    notes = []
 
-    # 管理者だけが見られる「投稿リクエスト」チャンネル（無ければ作る）
-    admin_channel = discord.utils.get(ctx.guild.text_channels, name=forum_request.REQUEST_ADMIN_CHANNEL_NAME)
-    if admin_channel is None:
-        admin_room = next((c for c in ctx.guild.text_channels if c.name.startswith("運営管理部屋")), None)
-        admin_role = discord.utils.get(ctx.guild.roles, name=ADMIN_ROLE_NAME)
-        overwrites = {
-            ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            ctx.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True),
-        }
-        if admin_role is not None:
-            overwrites[admin_role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
-        try:
-            admin_channel = await ctx.guild.create_text_channel(
-                forum_request.REQUEST_ADMIN_CHANNEL_NAME,
-                overwrites=overwrites,
-                category=admin_room.category if admin_room else None,
-            )
-            notes.append(f"・管理者だけが見られる {admin_channel.mention} を作りました")
-        except discord.HTTPException as error:
-            notes.append(f"・「{forum_request.REQUEST_ADMIN_CHANNEL_NAME}」チャンネルを作れませんでした（{error}）")
+    if kind == forum_request.KIND_POST:
+        forums = forum_request.community_forums(ctx.guild)
+        await ctx.send(forum_request.POST_PANEL_TEXT, view=forum_request.PostRequestPanel())
+    else:
+        forums = forum_request.owner_forums(ctx.guild)
+        await ctx.send(forum_request.CHANNEL_PANEL_TEXT, view=forum_request.ChannelRequestPanel())
 
-    done, failed = await forum_request.restrict_forum_posts(ctx.guild)
-    notes.append("・会員が直接枠を作れないようにしたフォーラム：" + ("、".join(done) if done else "なし"))
+    done, failed = await forum_request.restrict_new_posts(ctx.guild, forums)
+    notes = ["・会員が直接新しい投稿を作れないようにしたフォーラム：" + ("、".join(done) if done else "なし")]
     if failed:
         notes.append("・設定できなかったフォーラム：" + "、".join(failed))
-    if not forum_request.PREMIUM_ROLE_NAME:
-        notes.append(
-            "⚠️ Railwayの環境変数 PREMIUM_ROLE_NAME に、コミュニティ作成プラン（4000円）のロール名を入れてください。"
-            "入れるまでは、管理者以外はリクエストできません"
-        )
-
-    await ctx.send(forum_request.PANEL_TEXT, view=forum_request.RequestPanel())
-    target = admin_channel if admin_channel is not None else ctx.channel
-    await target.send("✅ 枠リクエストの仕組みを設定しました\n" + "\n".join(notes))
+    admin_channel = forum_request._admin_channel(ctx.guild)
+    if admin_channel is None:
+        notes.append(f"⚠️ リクエストが届く「{forum_request.REQUEST_ADMIN_CHANNEL_NAME}」チャンネルが見つかりません")
+    if forum_request._premium_role(ctx.guild) is None:
+        notes.append(f"⚠️ 「{forum_request.PREMIUM_ROLE_NAME}」ロールが見つかりません（環境変数 PREMIUM_ROLE_NAME）")
+    target = admin_channel or ctx.channel
+    await target.send(f"✅ {ctx.channel.mention} に作成リクエストのボタンを置きました\n" + "\n".join(notes))
 
 
 @bot.command(name="チャンネル数")
@@ -2197,10 +2186,10 @@ _community_announce_lock = asyncio.Lock()
 
 
 def _is_community_forum(channel) -> bool:
+    """主がいるフォーラム（「発信チャンネル」カテゴリのフォーラム）か。チャンネル紹介への告知の対象。"""
     return (
         isinstance(channel, discord.ForumChannel)
-        and channel.category is not None
-        and channel.category.name == COMMUNITY_CATEGORY_NAME
+        and forum_request.kind_for_category(channel.category) == forum_request.KIND_CHANNEL
     )
 
 
@@ -2271,9 +2260,9 @@ async def try_announce_community(channel) -> str:
     if not owners:
         return "skipped"  # 主がまだ追加されていない
 
-    notice_channel = discord.utils.get(channel.category.text_channels, name=COMMUNITY_NOTICE_CHANNEL_NAME)
+    notice_channel = forum_request._notice_channel(channel.category)
     if notice_channel is None:
-        print(f"「{COMMUNITY_CATEGORY_NAME}」カテゴリに「{COMMUNITY_NOTICE_CHANNEL_NAME}」チャンネルが見つかりません。")
+        print(f"「{channel.category.name}」カテゴリに「{forum_request.NOTICE_CHANNEL_NAME}」チャンネルが見つかりません。")
         return "skipped"
 
     text = _community_announcement_text(channel, owners, topic)
@@ -2304,7 +2293,7 @@ async def announce_community_command(ctx: commands.Context, community: discord.F
     告知メッセージを間違えて消してしまったときや、概要を保存しても告知が直らないときに使う。
     """
     if not _is_community_forum(community):
-        await ctx.send(f"{community.mention} は「{COMMUNITY_CATEGORY_NAME}」カテゴリのフォーラムではありません。")
+        await ctx.send(f"{community.mention} は「{forum_request.OWNER_FORUM_CATEGORY_NAME}」カテゴリのフォーラムではありません。")
         return
     try:
         result = await try_announce_community(community)
@@ -2453,7 +2442,8 @@ async def on_ready():
     bot.add_view(profile_edit.ProfileEditPanel())
     bot.add_view(inquiry.InquiryPanel())
     bot.add_view(inquiry.InquiryResolveView())
-    bot.add_view(forum_request.RequestPanel())
+    for view_class in forum_request.PERSISTENT_VIEWS:
+        bot.add_view(view_class())
     bot.add_dynamic_items(*forum_request.DYNAMIC_ITEMS)
     # 承認チャンネルの申請ボタン（承認する・断る・プロフィール）を、再起動後も反応させる
     bot.add_dynamic_items(*match_views.REQUEST_BUTTONS)
