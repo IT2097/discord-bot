@@ -12,6 +12,7 @@ from discord.ext import commands, tasks
 import match_views
 import match_store
 import match_records
+import forum_request
 import inquiry
 import member_archive
 import profile_edit
@@ -30,7 +31,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-11-06 投稿制限・マッチングルーム案内版"
+BOT_VERSION = "2026-11-07 枠リクエスト版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 # 会員一覧ページ（マッチング申請ページ）のURLを投稿するチャンネル（以前の名前は「マッチングルーム」）
@@ -1236,6 +1237,47 @@ async def cleanup_history(ctx: commands.Context):
         await ctx.send(f"{head}\n\n{listing}", view=view)
 
 
+@bot.command(name="枠リクエスト設置")
+@is_admin()
+async def setup_forum_requests(ctx: commands.Context):
+    """
+    作成リクエストのボタンを、打ったチャンネルに置く管理者向けコマンド。
+    打ったチャンネルのカテゴリで、置くボタンが変わる。
+      「コミュニティ」カテゴリ   … 趣味・在宅ワークなどのフォーラムに「枠」（投稿）を作るリクエスト
+      「発信チャンネル」カテゴリ … 主が発信する新しいフォーラムチャンネルを作るリクエスト
+    あわせて、そのカテゴリのフォーラムで、会員が直接新しい投稿を作れないようにする（返信はできる。主はこれまでどおり投稿できる）。
+    """
+    kind = forum_request.kind_for_category(ctx.channel.category)
+    if kind is None:
+        await ctx.send(
+            f"「{forum_request.COMMUNITY_CATEGORY_NAME}」か「{forum_request.OWNER_FORUM_CATEGORY_NAME}」カテゴリの中のチャンネルで打ってください。"
+        )
+        return
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+
+    if kind == forum_request.KIND_POST:
+        forums = forum_request.community_forums(ctx.guild)
+        await ctx.send(forum_request.POST_PANEL_TEXT, view=forum_request.PostRequestPanel())
+    else:
+        forums = forum_request.owner_forums(ctx.guild)
+        await ctx.send(forum_request.CHANNEL_PANEL_TEXT, view=forum_request.ChannelRequestPanel())
+
+    done, failed = await forum_request.restrict_new_posts(ctx.guild, forums)
+    notes = ["・会員が直接新しい投稿を作れないようにしたフォーラム：" + ("、".join(done) if done else "なし")]
+    if failed:
+        notes.append("・設定できなかったフォーラム：" + "、".join(failed))
+    admin_channel = forum_request._admin_channel(ctx.guild)
+    if admin_channel is None:
+        notes.append(f"⚠️ リクエストが届く「{forum_request.REQUEST_ADMIN_CHANNEL_NAME}」チャンネルが見つかりません")
+    if forum_request._premium_role(ctx.guild) is None:
+        notes.append(f"⚠️ 「{forum_request.PREMIUM_ROLE_NAME}」ロールが見つかりません（環境変数 PREMIUM_ROLE_NAME）")
+    target = admin_channel or ctx.channel
+    await target.send(f"✅ {ctx.channel.mention} に作成リクエストのボタンを置きました\n" + "\n".join(notes))
+
+
 @bot.command(name="チャンネル数")
 @is_admin()
 async def count_channels(ctx: commands.Context):
@@ -2144,10 +2186,10 @@ _community_announce_lock = asyncio.Lock()
 
 
 def _is_community_forum(channel) -> bool:
+    """主がいるフォーラム（「発信チャンネル」カテゴリのフォーラム）か。チャンネル紹介への告知の対象。"""
     return (
         isinstance(channel, discord.ForumChannel)
-        and channel.category is not None
-        and channel.category.name == COMMUNITY_CATEGORY_NAME
+        and forum_request.kind_for_category(channel.category) == forum_request.KIND_CHANNEL
     )
 
 
@@ -2218,9 +2260,9 @@ async def try_announce_community(channel) -> str:
     if not owners:
         return "skipped"  # 主がまだ追加されていない
 
-    notice_channel = discord.utils.get(channel.category.text_channels, name=COMMUNITY_NOTICE_CHANNEL_NAME)
+    notice_channel = forum_request._notice_channel(channel.category)
     if notice_channel is None:
-        print(f"「{COMMUNITY_CATEGORY_NAME}」カテゴリに「{COMMUNITY_NOTICE_CHANNEL_NAME}」チャンネルが見つかりません。")
+        print(f"「{channel.category.name}」カテゴリに「{forum_request.NOTICE_CHANNEL_NAME}」チャンネルが見つかりません。")
         return "skipped"
 
     text = _community_announcement_text(channel, owners, topic)
@@ -2251,7 +2293,7 @@ async def announce_community_command(ctx: commands.Context, community: discord.F
     告知メッセージを間違えて消してしまったときや、概要を保存しても告知が直らないときに使う。
     """
     if not _is_community_forum(community):
-        await ctx.send(f"{community.mention} は「{COMMUNITY_CATEGORY_NAME}」カテゴリのフォーラムではありません。")
+        await ctx.send(f"{community.mention} は「{forum_request.OWNER_FORUM_CATEGORY_NAME}」カテゴリのフォーラムではありません。")
         return
     try:
         result = await try_announce_community(community)
@@ -2400,6 +2442,9 @@ async def on_ready():
     bot.add_view(profile_edit.ProfileEditPanel())
     bot.add_view(inquiry.InquiryPanel())
     bot.add_view(inquiry.InquiryResolveView())
+    for view_class in forum_request.PERSISTENT_VIEWS:
+        bot.add_view(view_class())
+    bot.add_dynamic_items(*forum_request.DYNAMIC_ITEMS)
     # 承認チャンネルの申請ボタン（承認する・断る・プロフィール）を、再起動後も反応させる
     bot.add_dynamic_items(*match_views.REQUEST_BUTTONS)
     print(f"ログインしました: {bot.user}")
