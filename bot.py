@@ -12,6 +12,7 @@ from discord.ext import commands, tasks
 import match_views
 import match_store
 import match_records
+import forum_request
 import inquiry
 import member_archive
 import profile_edit
@@ -30,7 +31,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot_loop: asyncio.AbstractEventLoop | None = None
 
 # デプロイされているコードが最新かを確認するための目印（!id同期 の最初のメッセージに表示）
-BOT_VERSION = "2026-11-06 投稿制限・マッチングルーム案内版"
+BOT_VERSION = "2026-11-07 枠リクエスト版"
 
 # 会員向けの固定URL（会員情報の確認・マッチング申請ページ）を投稿するチャンネル名
 # 会員一覧ページ（マッチング申請ページ）のURLを投稿するチャンネル（以前の名前は「マッチングルーム」）
@@ -1236,6 +1237,58 @@ async def cleanup_history(ctx: commands.Context):
         await ctx.send(f"{head}\n\n{listing}", view=view)
 
 
+@bot.command(name="枠リクエスト設置")
+@is_admin()
+async def setup_forum_requests(ctx: commands.Context):
+    """
+    コミュニティのフォーラムに新しい枠（投稿）を作るときの「リクエスト→承認」の仕組みを設定する管理者向けコマンド。
+    打ったチャンネルに「📝 新しい枠をリクエスト」ボタンを置く（チャンネル紹介で打つ想定）。
+    あわせて、
+    - コミュニティのフォーラムで、会員が直接新しい投稿を作れないようにする（返信はできる）
+    - 管理者だけが見られる「投稿リクエスト」チャンネルが無ければ作る
+    """
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+    notes = []
+
+    # 管理者だけが見られる「投稿リクエスト」チャンネル（無ければ作る）
+    admin_channel = discord.utils.get(ctx.guild.text_channels, name=forum_request.REQUEST_ADMIN_CHANNEL_NAME)
+    if admin_channel is None:
+        admin_room = next((c for c in ctx.guild.text_channels if c.name.startswith("運営管理部屋")), None)
+        admin_role = discord.utils.get(ctx.guild.roles, name=ADMIN_ROLE_NAME)
+        overwrites = {
+            ctx.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            ctx.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True),
+        }
+        if admin_role is not None:
+            overwrites[admin_role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+        try:
+            admin_channel = await ctx.guild.create_text_channel(
+                forum_request.REQUEST_ADMIN_CHANNEL_NAME,
+                overwrites=overwrites,
+                category=admin_room.category if admin_room else None,
+            )
+            notes.append(f"・管理者だけが見られる {admin_channel.mention} を作りました")
+        except discord.HTTPException as error:
+            notes.append(f"・「{forum_request.REQUEST_ADMIN_CHANNEL_NAME}」チャンネルを作れませんでした（{error}）")
+
+    done, failed = await forum_request.restrict_forum_posts(ctx.guild)
+    notes.append("・会員が直接枠を作れないようにしたフォーラム：" + ("、".join(done) if done else "なし"))
+    if failed:
+        notes.append("・設定できなかったフォーラム：" + "、".join(failed))
+    if not forum_request.PREMIUM_ROLE_NAME:
+        notes.append(
+            "⚠️ Railwayの環境変数 PREMIUM_ROLE_NAME に、コミュニティ作成プラン（4000円）のロール名を入れてください。"
+            "入れるまでは、管理者以外はリクエストできません"
+        )
+
+    await ctx.send(forum_request.PANEL_TEXT, view=forum_request.RequestPanel())
+    target = admin_channel if admin_channel is not None else ctx.channel
+    await target.send("✅ 枠リクエストの仕組みを設定しました\n" + "\n".join(notes))
+
+
 @bot.command(name="チャンネル数")
 @is_admin()
 async def count_channels(ctx: commands.Context):
@@ -2400,6 +2453,8 @@ async def on_ready():
     bot.add_view(profile_edit.ProfileEditPanel())
     bot.add_view(inquiry.InquiryPanel())
     bot.add_view(inquiry.InquiryResolveView())
+    bot.add_view(forum_request.RequestPanel())
+    bot.add_dynamic_items(*forum_request.DYNAMIC_ITEMS)
     # 承認チャンネルの申請ボタン（承認する・断る・プロフィール）を、再起動後も反応させる
     bot.add_dynamic_items(*match_views.REQUEST_BUTTONS)
     print(f"ログインしました: {bot.user}")
