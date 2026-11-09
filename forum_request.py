@@ -98,6 +98,17 @@ def _admin_channel(guild: discord.Guild) -> discord.TextChannel | None:
     return next((c for c in guild.text_channels if c.name.startswith(REQUEST_ADMIN_CHANNEL_NAME)), None)
 
 
+def _admin_mention(guild: discord.Guild) -> tuple[str | None, discord.AllowedMentions]:
+    """リクエストが届いたことを知らせる、管理者ロールへのメンション（ロールが無ければメンションなし）。"""
+    role = discord.utils.find(lambda r: _norm(r.name) == _norm(ADMIN_ROLE_NAME), guild.roles)
+    if role is None:
+        print(f"「{ADMIN_ROLE_NAME}」という名前のロールが見つからないため、リクエストの通知でメンションできませんでした。")
+        return None, discord.AllowedMentions.none()
+    return f"{role.mention} 新しいリクエストが届きました。ご確認ください。", discord.AllowedMentions(
+        everyone=False, users=False, roles=[role]
+    )
+
+
 def _notice_channel(category: discord.CategoryChannel | None) -> discord.TextChannel | None:
     """カテゴリの中の「チャンネル紹介」。"""
     if category is None:
@@ -256,10 +267,12 @@ class PostRequestModal(discord.ui.Modal, title="コミュニティの枠をリ�
                 f"{forum.mention} には、すでに「{name}」という枠があります。名前を変えて送ってください。", ephemeral=True
             )
             return
+        content, mentions = _admin_mention(guild)
         await admin_channel.send(
+            content=content,
             embed=_request_embed(KIND_POST, interaction.user, name, self.body_input.value.strip(), forum.mention),
             view=_decision_view(KIND_POST, interaction.user.id, forum.id),
-            allowed_mentions=discord.AllowedMentions.none(),
+            allowed_mentions=mentions,
         )
         await interaction.followup.send(
             f"リクエストを送りました。運営が承認すると、{forum.mention} に「{name}」が作られます。結果はDMでもお知らせします。",
@@ -293,12 +306,14 @@ class ChannelRequestModal(discord.ui.Modal, title="発信チャンネルをリ�
                 f"「{name}」という名前のチャンネルがすでにあります。名前を変えて送ってください。", ephemeral=True
             )
             return
+        content, mentions = _admin_mention(guild)
         await admin_channel.send(
+            content=content,
             embed=_request_embed(
                 KIND_CHANNEL, interaction.user, name, self.body_input.value.strip(), f"「{category.name}」カテゴリ"
             ),
             view=_decision_view(KIND_CHANNEL, interaction.user.id, category.id),
-            allowed_mentions=discord.AllowedMentions.none(),
+            allowed_mentions=mentions,
         )
         await interaction.followup.send(
             f"リクエストを送りました。運営が承認すると、「{category.name}」に「{name}」チャンネルが作られます。"
