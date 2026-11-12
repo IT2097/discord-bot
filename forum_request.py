@@ -411,7 +411,7 @@ async def _create_owner_forum(
     """
     発信チャンネルのカテゴリに、リクエストした人が主のフォーラムを作る。
     - 会員など：見る・返信はできるが、新しい投稿は作れない
-    - 主：新しい投稿を作れて、自分のフォーラムの投稿を管理できる
+    - 主：新しい投稿を作れて、自分のフォーラムの投稿を管理できる。チャンネル名・説明なども変えられる（チャンネル管理）
     説明は投稿ガイドライン（トピック）に入る。告知は既存の仕組みが「チャンネル紹介」で自動で行う。
     """
     overwrites = dict(category.overwrites)  # カテゴリの見える・見えないの設定を引き継ぐ
@@ -433,6 +433,7 @@ async def _create_owner_forum(
     overwrites[requester] = discord.PermissionOverwrite(
         view_channel=True, send_messages=True, send_messages_in_threads=True,
         manage_threads=True, manage_messages=True, attach_files=True, embed_links=True, read_message_history=True,
+        manage_channels=True,  # 主が自分でチャンネル名や投稿ガイドラインを変えられるようにする
     )
     forum = await category.create_forum(name=name[:100], topic=body[:4096] or None, overwrites=overwrites)
     return forum.mention
@@ -581,6 +582,30 @@ PERSISTENT_VIEWS = (PostRequestPanel, ChannelRequestPanel)
 # ---------------------------------------------------------------------------
 # 設定（管理者コマンドから呼ぶ）
 # ---------------------------------------------------------------------------
+
+async def grant_owner_manage_channels(guild: discord.Guild) -> tuple[list[str], list[str]]:
+    """
+    すでにある発信チャンネルの主に「チャンネル管理」を付ける（チャンネル名などを自分で変えられるようにする）。
+    主は「個人に投稿の管理（manage_threads）が付いているメンバー」として見分ける。
+    """
+    done, failed = [], []
+    for forum in owner_forums(guild):
+        owners = [
+            target for target, overwrite in forum.overwrites.items()
+            if isinstance(target, discord.Member) and target.id != guild.me.id and overwrite.manage_threads
+        ]
+        for owner in owners:
+            overwrite = forum.overwrites_for(owner)
+            if overwrite.manage_channels:
+                continue
+            overwrite.update(manage_channels=True)
+            try:
+                await forum.set_permissions(owner, overwrite=overwrite, reason="発信チャンネルの主にチャンネル管理を付与")
+                done.append(f"{forum.mention}（{owner.display_name}）")
+            except discord.HTTPException:
+                failed.append(f"{forum.mention}（{owner.display_name}）")
+    return done, failed
+
 
 async def restrict_new_posts(guild: discord.Guild, forums: list[discord.ForumChannel]) -> tuple[list[str], list[str]]:
     """

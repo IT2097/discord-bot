@@ -378,20 +378,8 @@ async def run_id_sync(guild: discord.Guild, send):
     lines.append("")
     lines.extend(_format_role_result(role_result))
 
-    # 「Discordにいるがシートで一致しなかった表示名」がある場合だけ、
-    # 管理者ロールにメンションして気づきやすくする
-    # （候補が複数・シート側だけの未一致は既存データに大量にあるため対象外にする）
-    needs_attention = bool(result["unmatched_discord_names"])
-    mention_prefix = ""
-    if needs_attention:
-        admin_role = discord.utils.get(guild.roles, name=ADMIN_ROLE_NAME)
-        if admin_role is not None:
-            mention_prefix = f"{admin_role.mention} シートに無いDiscordメンバーがいます。ご確認ください。\n\n"
-        else:
-            print(f"「{ADMIN_ROLE_NAME}」という名前のロールが見つからないため、メンションできませんでした。")
-
     body = "\n".join(lines)
-    message = mention_prefix + body
+    message = body
 
     if len(message) <= 1900:
         await send(message)
@@ -399,7 +387,7 @@ async def run_id_sync(guild: discord.Guild, send):
         # Discordの1メッセージ2000文字制限を超える場合はテキストファイルで送る
         buffer = io.StringIO(body)
         await send(
-            f"{mention_prefix}結果が長くなったのでファイルに出力しました。",
+            "結果が長くなったのでファイルに出力しました。",
             file=discord.File(fp=buffer, filename="id同期結果.txt"),
         )
 
@@ -1276,6 +1264,20 @@ async def setup_forum_requests(ctx: commands.Context):
         notes.append(f"⚠️ 「{forum_request.PREMIUM_ROLE_NAME}」ロールが見つかりません（環境変数 PREMIUM_ROLE_NAME）")
     target = admin_channel or ctx.channel
     await target.send(f"✅ {ctx.channel.mention} に作成リクエストのボタンを置きました\n" + "\n".join(notes))
+
+
+@bot.command(name="発信チャンネル権限更新")
+@is_admin()
+async def grant_owner_manage(ctx: commands.Context):
+    """
+    すでにある発信チャンネルの主に「チャンネル管理」を付ける管理者向けコマンド。
+    （これから承認して作る発信チャンネルには、最初から付く）
+    """
+    done, failed = await forum_request.grant_owner_manage_channels(ctx.guild)
+    lines = ["✅ 発信チャンネルの主に「チャンネル管理」を付けました：" + ("、".join(done) if done else "なし（付ける必要のあるチャンネルはありませんでした）")]
+    if failed:
+        lines.append("⚠️ 付けられなかったチャンネル：" + "、".join(failed))
+    await ctx.send("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.command(name="チャンネル数")
