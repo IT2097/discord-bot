@@ -1278,6 +1278,20 @@ async def setup_forum_requests(ctx: commands.Context):
     await target.send(f"✅ {ctx.channel.mention} に作成リクエストのボタンを置きました\n" + "\n".join(notes))
 
 
+@bot.command(name="発信チャンネル権限更新")
+@is_admin()
+async def grant_owner_manage(ctx: commands.Context):
+    """
+    すでにある発信チャンネルの主に「チャンネル管理」を付ける管理者向けコマンド。
+    （これから承認して作る発信チャンネルには、最初から付く）
+    """
+    done, failed = await forum_request.grant_owner_manage_channels(ctx.guild)
+    lines = ["✅ 発信チャンネルの主に「チャンネル管理」を付けました：" + ("、".join(done) if done else "なし（付ける必要のあるチャンネルはありませんでした）")]
+    if failed:
+        lines.append("⚠️ 付けられなかったチャンネル：" + "、".join(failed))
+    await ctx.send("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
+
+
 @bot.command(name="チャンネル数")
 @is_admin()
 async def count_channels(ctx: commands.Context):
