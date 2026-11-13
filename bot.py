@@ -1280,6 +1280,25 @@ async def grant_owner_manage(ctx: commands.Context):
     await ctx.send("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
 
 
+@bot.command(name="ルーム復元")
+@is_admin()
+async def restore_room_threads(ctx: commands.Context):
+    """
+    一覧から隠れてしまった（アーカイブされた）マッチングルームのスレッドを、今すぐ元に戻す管理者向けコマンド。
+    ふだんは30分ごとの定期処理で自動で戻している。
+    """
+    await ctx.send("隠れているマッチングルームを探しています…")
+    result = await match_views.keep_room_threads_open(ctx.guild)
+    if result["error"]:
+        await ctx.send(f"⚠️ {result['error']}")
+        return
+    lines = [f"✅ 隠れていたマッチングルームを {result['restored']} 件、一覧に戻しました。"]
+    if result["failed"]:
+        lines.append(f"⚠️ 戻せなかったルーム：{len(result['failed'])}件（" + "、".join(result["failed"][:20]) + "）")
+    lines.append(f"・定期処理（30分ごと）：{'動いています' if check_match_requests.is_running() else '⚠️ 止まっています'}")
+    await ctx.send("\n".join(lines)[:1900], allowed_mentions=discord.AllowedMentions.none())
+
+
 @bot.command(name="チャンネル数")
 @is_admin()
 async def count_channels(ctx: commands.Context):

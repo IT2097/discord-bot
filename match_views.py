@@ -254,22 +254,37 @@ async def room_pair(room) -> list[str] | None:
     return None
 
 
-async def keep_room_threads_open(guild: discord.Guild) -> int:
-    """アーカイブされた（一覧から隠れた）マッチングルームのスレッドを元に戻す。戻した数を返す。"""
+async def keep_room_threads_open(guild: discord.Guild) -> dict:
+    """
+    アーカイブされた（7日間やり取りが無くて一覧から隠れた）マッチングルームのスレッドを元に戻す。
+    「マッチングルーム」チャンネルの中のスレッドは、会員が自分で作れないので、すべてマッチングルームとみなす。
+    （マッチング履歴にルームIDが残っていないルームも戻せるよう、履歴とは照らし合わせない）
+    ロックされているスレッドは、運営が意図して閉じたものとして戻さない。
+    戻り値：{"restored": 戻した数, "failed": [失敗したスレッド名], "error": 一覧を取れなかったときの理由}
+    """
+    result = {"restored": 0, "failed": [], "error": None}
     parent = find_room_parent(guild)
     if parent is None:
-        return 0
-    room_ids = {r["room_id"] for r in await asyncio.to_thread(match_records.get_all_records)}
-    restored = 0
-    async for thread in parent.archived_threads(private=True, limit=None):
-        if str(thread.id) not in room_ids:
+        result["error"] = f"「{MATCH_ROOM_CHANNEL_NAME}」チャンネルが見つかりません"
+        return result
+    try:
+        threads = [t async for t in parent.archived_threads(private=True, limit=None)]
+    except discord.HTTPException as error:
+        result["error"] = f"アーカイブ中のスレッドの一覧を取れませんでした（botの「スレッドの管理」権限を確認）：{error}"
+        print(result["error"])
+        return result
+    for thread in threads:
+        if thread.locked:
             continue
         try:
             await thread.edit(archived=False, auto_archive_duration=10080)
-            restored += 1
+            result["restored"] += 1
         except discord.HTTPException as error:
+            result["failed"].append(thread.name)
             print(f"スレッド「{thread.name}」のアーカイブを戻せませんでした：{error}")
-    return restored
+    if result["restored"] or result["failed"]:
+        print(f"マッチングルームのアーカイブ解除：{result['restored']}件戻した／失敗{len(result['failed'])}件")
+    return result
 
 
 # ---------------------------------------------------------------------------
