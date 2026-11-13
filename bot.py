@@ -1299,6 +1299,104 @@ async def restore_room_threads(ctx: commands.Context):
     await ctx.send("\n".join(lines)[:1900], allowed_mentions=discord.AllowedMentions.none())
 
 
+@bot.command(name="ルーム診断")
+@is_admin()
+async def diagnose_rooms(ctx: commands.Context, member: discord.Member | None = None):
+    """
+    マッチングルームが見えなくなったときの原因を調べる管理者向けコマンド（何も変更しない）。
+      !ルーム診断        … 全体の件数（表示中・隠れている・見つからないルーム）
+      !ルーム診断 @会員  … その会員のマッチングルーム1つずつの状態（本人がルームに入っているか など）
+    """
+    await ctx.send("マッチングルームの状態を調べています…")
+    guild = ctx.guild
+    parent = match_views.find_room_parent(guild)
+    records = await asyncio.to_thread(match_records.get_all_records, True)
+
+    active: dict[int, discord.Thread] = {}
+    archived: dict[int, discord.Thread] = {}
+    archive_error = None
+    if parent is not None:
+        try:
+            for thread in await guild.active_threads():
+                if thread.parent_id == parent.id:
+                    active[thread.id] = thread
+        except discord.HTTPException as error:
+            archive_error = f"表示中のスレッドの一覧を取れませんでした：{error}"
+        try:
+            async for thread in parent.archived_threads(private=True, limit=None):
+                archived[thread.id] = thread
+        except discord.HTTPException as error:
+            archive_error = f"隠れているスレッドの一覧を取れませんでした：{error}"
+    channel_ids = {c.id for c in guild.text_channels}
+
+    def status_of(room_id: str) -> str:
+        if not room_id:
+            return "ルームIDの記録なし"
+        try:
+            rid = int(room_id)
+        except ValueError:
+            return f"ルームIDがおかしい（{room_id}）"
+        if rid in active:
+            return "表示中のスレッド"
+        if rid in archived:
+            return "隠れているスレッド（ロック中）" if archived[rid].locked else "隠れているスレッド"
+        if rid in channel_ids:
+            return "チャンネル（旧方式）"
+        return "見つからない（削除済み？）"
+
+    if member is None:
+        counts: dict[str, int] = {}
+        for record in records:
+            key = status_of(record["room_id"])
+            counts[key] = counts.get(key, 0) + 1
+        recorded = {r["room_id"] for r in records}
+        lines = [
+            "📊 **マッチングルーム診断**",
+            f"・「{match_views.MATCH_ROOM_CHANNEL_NAME}」チャンネル：{parent.mention if parent else '⚠️ 見つかりません'}",
+            f"・チャンネル内のスレッド：表示中 {len(active)} 件／隠れている {len(archived)} 件"
+            f"（うちロック中 {sum(1 for t in archived.values() if t.locked)} 件）",
+            f"・履歴に無いスレッド：{sum(1 for i in [*active, *archived] if str(i) not in recorded)} 件",
+            f"・マッチング履歴：{len(records)} 件",
+        ]
+        lines += [f"　・{key}：{count} 件" for key, count in sorted(counts.items(), key=lambda kv: -kv[1])]
+        lines.append(f"・定期処理（30分ごと）：{'動いています' if check_match_requests.is_running() else '⚠️ 止まっています'}")
+        if archive_error:
+            lines.append(f"⚠️ {archive_error}")
+        lines.append("（会員ごとに調べるときは `!ルーム診断 @会員`）")
+        await ctx.send("\n".join(lines)[:1900], allowed_mentions=discord.AllowedMentions.none())
+        return
+
+    mine = [r for r in records if member.id and str(member.id) in (r["a"], r["b"])]
+    lines = [f"📊 **{member.display_name} さんのマッチングルーム**（履歴 {len(mine)} 件）"]
+    for record in mine:
+        other_id = record["b"] if record["a"] == str(member.id) else record["a"]
+        other = guild.get_member(int(other_id)) if other_id.isdigit() else None
+        other_name = other.display_name if other else f"サーバーにいない（{other_id}）"
+        status = status_of(record["room_id"])
+        joined = ""
+        rid = int(record["room_id"]) if record["room_id"].isdigit() else None
+        thread = active.get(rid) or archived.get(rid) if rid else None
+        if thread is not None:
+            try:
+                ids = {m.id for m in await thread.fetch_members()}
+                joined = "／本人：" + ("入っている" if member.id in ids else "⚠️ 入っていない")
+                joined += "／相手：" + ("入っている" if other and other.id in ids else "入っていない")
+            except discord.HTTPException as error:
+                joined = f"／参加者を確認できませんでした：{error}"
+        lines.append(f"・{other_name}：{status}{joined}")
+    if not mine:
+        lines.append("・マッチング履歴にこの会員の記録がありません")
+    text = "\n".join(lines)
+    if len(text) > 1900:
+        await ctx.send(
+            "結果が長いのでファイルにしました。",
+            file=discord.File(io.BytesIO(text.encode("utf-8")), filename="ルーム診断.txt"),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    else:
+        await ctx.send(text, allowed_mentions=discord.AllowedMentions.none())
+
+
 @bot.command(name="チャンネル数")
 @is_admin()
 async def count_channels(ctx: commands.Context):
