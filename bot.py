@@ -905,8 +905,59 @@ async def bulk_delete_rooms(ctx: commands.Context, *, keyword: str):
 ROOM_GUIDE_MARK = "📌 **マッチングルームの使い方**"
 
 
+class MyRoomsView(discord.ui.View):
+    """「自分のマッチングルーム一覧」ボタン（再起動しても押せるよう custom_id を固定）。"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="自分のマッチングルーム一覧", emoji="📋", style=discord.ButtonStyle.primary, custom_id="my_rooms_list")
+    async def show(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        member_id = str(interaction.user.id)
+        try:
+            records = await asyncio.to_thread(match_records.rooms_for_member, member_id)
+        except Exception as error:  # noqa: BLE001 - 本人にはエラーとだけ伝える
+            print(f"マッチングルーム一覧の取得に失敗しました：{error}")
+            await interaction.followup.send("一覧を読み込めませんでした。少し待ってからもう一度押してください。", ephemeral=True)
+            return
+
+        lines = []
+        for record in records:
+            try:
+                room = await _get_room(guild, int(record["room_id"]))
+            except ValueError:
+                room = None
+            if room is None:
+                continue
+            if isinstance(room, discord.Thread) and room.archived and not room.locked:
+                try:
+                    await room.edit(archived=False)  # 隠れていたら戻してから案内する
+                except discord.HTTPException:
+                    pass
+            other_id = record["b"] if record["a"] == member_id else record["a"]
+            other = guild.get_member(int(other_id)) if other_id.isdigit() else None
+            name = other.display_name if other else "退会した方"
+            lines.append(f"・{name} さん：{room.mention}")
+
+        if not lines:
+            await interaction.followup.send("今入っているマッチングルームはありません。", ephemeral=True)
+            return
+        head = f"📋 **あなたのマッチングルーム（{len(lines)}件）**\nリンクを押すと、そのルームが開きます。\n"
+        chunks, current = [], head
+        for line in lines:
+            if len(current) + len(line) + 1 > 1900:
+                chunks.append(current)
+                current = ""
+            current += line + "\n"
+        chunks.append(current)
+        for chunk in chunks:
+            await interaction.followup.send(chunk, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
 async def _post_room_guide(channel: discord.TextChannel):
-    """「マッチングルーム」チャンネルに使い方の案内を投稿する（すでにあれば書き換える）。"""
+    """「マッチングルーム」チャンネルに使い方の案内と一覧ボタンを投稿する（すでにあれば書き換える）。"""
     apply_channel = next(
         (c for c in channel.guild.text_channels if c.name == MATCHING_ROOM_CHANNEL_NAME and not match_views.is_room_parent(c)),
         None,
@@ -916,6 +967,7 @@ async def _post_room_guide(channel: discord.TextChannel):
         f"{ROOM_GUIDE_MARK}\n"
         "マッチングが成立すると、このチャンネルの中に**2人だけのスレッド**が作られます。\n\n"
         "**🔍 自分のマッチングルームの探し方**\n"
+        "・下の「📋 自分のマッチングルーム一覧」ボタンを押すと、あなたのルームへのリンクが並びます（いちばん確実です）\n"
         "・パソコン：右上のスレッドのマーク（🧵）から一覧を開く\n"
         "・スマホ：チャンネル名をタップすると、スレッドの一覧が出ます\n\n"
         "**📝 知っておいてほしいこと**\n"
@@ -926,10 +978,10 @@ async def _post_room_guide(channel: discord.TextChannel):
     )
     async for message in channel.history(limit=50):
         if message.author.id == channel.guild.me.id and message.content.startswith(ROOM_GUIDE_MARK):
-            if message.content != text:
-                await message.edit(content=text)
+            if message.content != text or not message.components:
+                await message.edit(content=text, view=MyRoomsView())
             return
-    message = await channel.send(text)
+    message = await channel.send(text, view=MyRoomsView())
     try:
         await message.pin()
     except discord.HTTPException:
@@ -2558,6 +2610,7 @@ async def on_ready():
     # Railway再起動後も既存ボタンを反応させる
     bot.add_view(MatchView())
     bot.add_view(NameRegisterView())
+    bot.add_view(MyRoomsView())
     bot.add_view(profile_edit.ProfileEditPanel())
     bot.add_view(inquiry.InquiryPanel())
     bot.add_view(inquiry.InquiryResolveView())
@@ -2575,6 +2628,16 @@ async def on_ready():
         print(f"マッチング申請の読み込みに失敗しました：{error}")
     if not check_match_requests.is_running():
         check_match_requests.start()
+
+    # 「マッチングルーム」チャンネルの使い方の案内に、一覧ボタンを付ける（すでに付いていれば何もしない）
+    guild_id = os.getenv("GUILD_ID")
+    guild = bot.get_guild(int(guild_id)) if guild_id else None
+    room_parent = match_views.find_room_parent(guild) if guild else None
+    if room_parent is not None:
+        try:
+            await _post_room_guide(room_parent)
+        except discord.HTTPException as error:
+            print(f"マッチングルームの案内（一覧ボタン）を更新できませんでした：{error}")
 
     await post_matching_room_link()
 
