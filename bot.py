@@ -956,6 +956,81 @@ class MyRoomsView(discord.ui.View):
             await interaction.followup.send(chunk, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
+class MyRequestsView(discord.ui.View):
+    """承認チャンネルの「自分への申請一覧」ボタン（再起動しても押せるよう custom_id を固定）。"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="自分への申請一覧", emoji="📋", style=discord.ButtonStyle.primary, custom_id="my_requests_list")
+    async def show(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        member_id = str(interaction.user.id)
+        try:
+            pending = await asyncio.to_thread(match_store.pending_requests)
+        except Exception as error:  # noqa: BLE001 - 本人にはエラーとだけ伝える
+            print(f"申請一覧の取得に失敗しました：{error}")
+            await interaction.followup.send("一覧を読み込めませんでした。少し待ってからもう一度押してください。", ephemeral=True)
+            return
+
+        lines = []
+        for request in sorted(pending, key=lambda r: r.get("created_at") or 0):
+            if request.get("target_id") != member_id or not request.get("channel_id"):
+                continue
+            try:
+                thread = await _get_room(guild, int(request["channel_id"]))
+            except ValueError:
+                thread = None
+            if thread is None:
+                continue
+            if isinstance(thread, discord.Thread) and thread.archived and not thread.locked:
+                try:
+                    await thread.edit(archived=False)  # 隠れていたら戻してから案内する
+                except discord.HTTPException:
+                    pass
+            requester = guild.get_member(int(request["requester_id"])) if str(request.get("requester_id", "")).isdigit() else None
+            name = requester.display_name if requester else "退会した方"
+            lines.append(f"・{name} さんから：{thread.mention}")
+
+        if not lines:
+            await interaction.followup.send("今、あなたへの承認待ちの申請はありません。", ephemeral=True)
+            return
+        head = f"📋 **あなたへの承認待ちの申請（{len(lines)}件）**\nリンクを押すと、その申請が開きます（承認する・断るはその中のボタンから）。\n"
+        chunks, current = [], head
+        for line in lines:
+            if len(current) + len(line) + 1 > 1900:
+                chunks.append(current)
+                current = ""
+            current += line + "\n"
+        chunks.append(current)
+        for chunk in chunks:
+            await interaction.followup.send(chunk, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+async def _post_approval_guide(channel: discord.TextChannel):
+    """承認チャンネルに使い方の案内と一覧ボタンを投稿する（すでにあれば書き換える）。"""
+    text = (
+        f"{match_views.APPROVAL_GUIDE_MARK}\n"
+        "あなたにマッチング申請が届くと、このチャンネルの中に**あなただけが見られるスレッド**が作られます。\n"
+        "スレッドの中のボタンから、承認する・断るを選んでください。\n\n"
+        "**🔍 届いた申請の探し方**\n"
+        "・下の「📋 自分への申請一覧」ボタンを押すと、承認待ちの申請へのリンクが並びます（いちばん確実です）\n"
+        "・パソコン：右上のスレッドのマーク（🧵）から一覧を開く\n"
+        "・スマホ：チャンネル名をタップすると、スレッドの一覧が出ます"
+    )
+    async for message in channel.history(limit=50):
+        if message.author.id == channel.guild.me.id and message.content.startswith(match_views.APPROVAL_GUIDE_MARK):
+            if message.content != text or not message.components:
+                await message.edit(content=text, view=MyRequestsView())
+            return
+    message = await channel.send(text, view=MyRequestsView())
+    try:
+        await message.pin()
+    except discord.HTTPException:
+        pass
+
+
 async def _post_room_guide(channel: discord.TextChannel):
     """「マッチングルーム」チャンネルに使い方の案内と一覧ボタンを投稿する（すでにあれば書き換える）。"""
     apply_channel = next(
@@ -2611,6 +2686,7 @@ async def on_ready():
     bot.add_view(MatchView())
     bot.add_view(NameRegisterView())
     bot.add_view(MyRoomsView())
+    bot.add_view(MyRequestsView())
     bot.add_view(profile_edit.ProfileEditPanel())
     bot.add_view(inquiry.InquiryPanel())
     bot.add_view(inquiry.InquiryResolveView())
@@ -2638,6 +2714,12 @@ async def on_ready():
             await _post_room_guide(room_parent)
         except discord.HTTPException as error:
             print(f"マッチングルームの案内（一覧ボタン）を更新できませんでした：{error}")
+    approval_channel = discord.utils.get(guild.text_channels, name=match_views.APPROVAL_CHANNEL_NAME) if guild else None
+    if approval_channel is not None:
+        try:
+            await _post_approval_guide(approval_channel)
+        except discord.HTTPException as error:
+            print(f"承認チャンネルの案内（一覧ボタン）を更新できませんでした：{error}")
 
     await post_matching_room_link()
 

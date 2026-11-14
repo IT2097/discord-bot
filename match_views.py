@@ -17,6 +17,8 @@ GUILD_ID = os.getenv("GUILD_ID")
 
 # マッチング申請の承認メッセージを投稿するテキストチャンネル名
 APPROVAL_CHANNEL_NAME = os.getenv("APPROVAL_CHANNEL_NAME", "承認")
+# 承認チャンネルの案内（「自分への申請一覧」ボタン付き）。この文字で始まるbotのメッセージは片付けの対象にしない
+APPROVAL_GUIDE_MARK = "📌 **承認チャンネルの使い方**"
 
 # マッチングルームをまとめて入れるカテゴリ名。
 # オーナーはこのカテゴリをミュート＋「ミュートしたチャンネルを非表示」にすることで、
@@ -957,7 +959,8 @@ async def migrate_approval_channel(bot: discord.Client, channel: discord.TextCha
 
     deleted = await channel.purge(
         limit=2000,
-        check=lambda m: m.author.id == bot.user.id and m.id not in keep_ids,
+        check=lambda m: m.author.id == bot.user.id and m.id not in keep_ids
+        and not m.content.startswith(APPROVAL_GUIDE_MARK),
     )
     return {"moved": moved, "failed": failed, "deleted": len(deleted)}
 
@@ -1012,11 +1015,10 @@ async def process_pending_requests(bot: discord.Client):
             thread_id = int(request["channel_id"])
         except ValueError:
             continue
-        if bot.get_channel(thread_id) is not None:
-            continue  # アーカイブされていないスレッド・通常のチャンネルはbotの手元にある
         try:
-            channel = await bot.fetch_channel(thread_id)
-            if isinstance(channel, discord.Thread) and channel.archived:
+            # botの手元の情報が古いこともあるので、手元に無いときだけDiscordに問い合わせる
+            channel = bot.get_channel(thread_id) or await bot.fetch_channel(thread_id)
+            if isinstance(channel, discord.Thread) and channel.archived and not channel.locked:
                 await channel.edit(archived=False)
         except discord.HTTPException:
             pass
