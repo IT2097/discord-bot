@@ -13,6 +13,8 @@ import match_views
 import match_store
 import match_records
 import forum_request
+import referral
+import referral_views
 import inquiry
 import member_archive
 import profile_edit
@@ -1524,6 +1526,73 @@ async def diagnose_rooms(ctx: commands.Context, member: discord.Member | None = 
         await ctx.send(text, allowed_mentions=discord.AllowedMentions.none())
 
 
+# ---------------------------------------------------------------------------
+# 紹介制度（Stripe 連携。仕組みは referral.py、ボタンは referral_views.py）
+# ---------------------------------------------------------------------------
+
+@tasks.loop(hours=6)
+async def grant_referral_rewards():
+    """付与予定日（紹介された人が支払った月の翌月末）が来た紹介特典を、紹介者の会費から差し引く形で付与する。"""
+    try:
+        result = await asyncio.to_thread(referral.grant_due_rewards)
+    except Exception as error:  # noqa: BLE001 - 定期処理が止まらないようにログだけ残す
+        print(f"紹介特典の付与でエラー：{error}")
+        return
+    if result["granted"] or result["excluded"] or result["errors"]:
+        print(f"紹介特典：付与{result['granted']}件（{result['amount']}円）／対象外{result['excluded']}件／エラー{len(result['errors'])}件")
+
+
+@bot.command(name="紹介パネル設置")
+@is_admin()
+async def post_referral_panel(ctx: commands.Context):
+    """打ったチャンネルに「🎁 紹介リンクを発行・確認」ボタンを置く管理者向けコマンド。"""
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+    await ctx.send(referral_views.PANEL_TEXT, view=referral_views.ReferralPanel())
+    if not referral.is_configured():
+        await ctx.send("⚠️ RailwayのVariablesに STRIPE_API_KEY が無いため、まだ紹介リンクを発行できません。", delete_after=60)
+
+
+@bot.command(name="紹介特典付与")
+@is_admin()
+async def run_referral_rewards(ctx: commands.Context):
+    """付与予定日が来た紹介特典を、今すぐ付与する管理者向けコマンド（ふだんは6時間ごとに自動で行う）。"""
+    if not referral.is_configured():
+        await ctx.send("RailwayのVariablesに STRIPE_API_KEY が設定されていません。")
+        return
+    await ctx.send("紹介特典を確認しています…")
+    try:
+        result = await asyncio.to_thread(referral.grant_due_rewards)
+    except Exception as error:  # noqa: BLE001 - 管理者にそのままエラー内容を見せる
+        await ctx.send(f"⚠️ エラーが発生しました：{error}")
+        return
+    lines = [
+        f"✅ 紹介特典を {result['granted']} 件（合計 {result['amount']:,} 円）付与しました。",
+        f"・対象外にしたもの：{result['excluded']} 件（理由はスプレッドシートの「{referral.SHEET_REWARDS}」のメモ欄）",
+    ]
+    if result["errors"]:
+        lines.append(f"⚠️ エラー {len(result['errors'])} 件（次回また試します）：" + "／".join(result["errors"][:5]))
+    await ctx.send("\n".join(lines)[:1900])
+
+
+@bot.command(name="契約者同期")
+@is_admin()
+async def sync_subscribers(ctx: commands.Context):
+    """Stripe のすべての契約を、スプレッドシートの「契約者一覧」に反映する管理者向けコマンド。"""
+    if not referral.is_configured():
+        await ctx.send("RailwayのVariablesに STRIPE_API_KEY が設定されていません。")
+        return
+    await ctx.send("Stripeの契約を読み込んでいます…（1件あたり1秒ほどかかります）")
+    try:
+        count = await asyncio.to_thread(referral.sync_all_subscriptions)
+    except Exception as error:  # noqa: BLE001
+        await ctx.send(f"⚠️ エラーが発生しました：{error}")
+        return
+    await ctx.send(f"✅ {count} 件の契約を「{referral.SHEET_SUBSCRIBERS}」シートに反映しました。")
+
+
 @bot.command(name="チャンネル数")
 @is_admin()
 async def count_channels(ctx: commands.Context):
@@ -2687,6 +2756,7 @@ async def on_ready():
     bot.add_view(NameRegisterView())
     bot.add_view(MyRoomsView())
     bot.add_view(MyRequestsView())
+    bot.add_view(referral_views.ReferralPanel())
     bot.add_view(profile_edit.ProfileEditPanel())
     bot.add_view(inquiry.InquiryPanel())
     bot.add_view(inquiry.InquiryResolveView())
@@ -2704,6 +2774,8 @@ async def on_ready():
         print(f"マッチング申請の読み込みに失敗しました：{error}")
     if not check_match_requests.is_running():
         check_match_requests.start()
+    if referral.is_configured() and not grant_referral_rewards.is_running():
+        grant_referral_rewards.start()
 
     # 「マッチングルーム」チャンネルの使い方の案内に、一覧ボタンを付ける（すでに付いていれば何もしない）
     guild_id = os.getenv("GUILD_ID")

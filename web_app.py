@@ -16,6 +16,7 @@ from flask import Flask, redirect, render_template, request, session, url_for, f
 import sheets_client
 import known_store
 import match_store
+import referral
 
 DISCORD_API_BASE = "https://discord.com/api"
 
@@ -249,6 +250,12 @@ def create_app(bot, run_coro):
         session["discord_id"] = discord_id
         session["discord_name"] = discord_name
         return redirect(url_for("index"))
+
+    @app.route("/stripe/webhook", methods=["POST"])
+    def stripe_webhook():
+        """Stripe からの知らせ（申し込み・支払い・契約の変更）を受け取る。紹介制度と契約者一覧に使う。"""
+        body, status = referral.handle_webhook(request.get_data(), request.headers.get("Stripe-Signature", ""))
+        return body, status
 
     @app.route("/logout")
     def logout():
