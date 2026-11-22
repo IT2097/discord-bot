@@ -17,8 +17,10 @@
    月ごと・紹介者ごとにまとめ、運営が手で口座に振り込む（振り込んだら状態を「振込済み」にする）。
 
 【報酬のルール（紹介制度規約より）】
-・紹介された人が一般プラン（2,200円）なら月500円、チャンネル作成プラン（4,400円）なら月1,000円
-・報酬を受け取れるのは、紹介された人が支払った時点で、紹介者がチャンネル作成プランの会員のときだけ
+・紹介された人のプランで、一般プラン（2,200円）なら月500円、アフィリエイトプラン（3,300円）なら月750円、
+  チャンネル作成プラン（4,400円）なら月1,000円
+・報酬を受け取れるのは、紹介された人が支払った時点で、紹介者がアフィリエイトプランか
+  チャンネル作成プランの会員のときだけ（一般プランの会員の紹介は記録だけ残す）
 ・付与する時点で紹介者が退会していたら付与しない
 ・紹介者本人による入会は対象外
 
@@ -26,7 +28,8 @@
 STRIPE_API_KEY         … Stripe の秘密キー（制限付きキー推奨。顧客・サブスクリプション・請求書・Checkout の読み取り、
                           顧客の残高（Customer balance）とサブスクリプションの書き込み）
 STRIPE_WEBHOOK_SECRET  … Webhook の署名シークレット（whsec_...）
-（任意）STRIPE_PRICE_GENERAL / STRIPE_PRICE_CREATOR … プランの価格ID。未設定なら金額（2,200円／4,400円）で見分ける
+（任意）STRIPE_PRICE_GENERAL / STRIPE_PRICE_AFFILIATE / STRIPE_PRICE_CREATOR … プランの価格ID。
+        未設定なら金額（2,200円／3,300円／4,400円）で見分ける
 （任意）REFERRAL_LINK_BASE … 紹介リンクの元のURL（標準：https://resense-inc.com/reje/）
 """
 
@@ -54,13 +57,22 @@ JST = timezone(timedelta(hours=9))
 STRIPE_API_KEY = os.getenv("STRIPE_API_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 PRICE_GENERAL = os.getenv("STRIPE_PRICE_GENERAL", "")
+PRICE_AFFILIATE = os.getenv("STRIPE_PRICE_AFFILIATE", "")
 PRICE_CREATOR = os.getenv("STRIPE_PRICE_CREATOR", "")
 REFERRAL_LINK_BASE = os.getenv("REFERRAL_LINK_BASE", "https://resense-inc.com/reje/")
 
 PLAN_GENERAL = "一般プラン"
+PLAN_AFFILIATE = "アフィリエイトプラン"
 PLAN_CREATOR = "チャンネル作成プラン"
-REWARD_BY_PLAN = {PLAN_GENERAL: 500, PLAN_CREATOR: 1000}
-_PLAN_BY_AMOUNT = {2200: PLAN_GENERAL, 4400: PLAN_CREATOR}
+REWARD_BY_PLAN = {PLAN_GENERAL: 500, PLAN_AFFILIATE: 750, PLAN_CREATOR: 1000}
+_PLAN_BY_AMOUNT = {2200: PLAN_GENERAL, 3300: PLAN_AFFILIATE, 4400: PLAN_CREATOR}
+REFERRER_PLANS = (PLAN_CREATOR, PLAN_AFFILIATE)  # 紹介特典を受け取れるプラン（先にあるほど優先）
+_NOT_REFERRER_PLAN = "紹介者が紹介特典の対象プラン（アフィリエイト・チャンネル作成）ではありません"
+
+
+def _referrer_rank(plan: str) -> int:
+    """紹介特典を受け取れるプランほど小さい数（並べ替え用）。"""
+    return REFERRER_PLANS.index(plan) if plan in REFERRER_PLANS else len(REFERRER_PLANS)
 
 STATUS_SCHEDULED = "予定"
 STATUS_GRANTED = "付与済み"
@@ -242,6 +254,8 @@ def _plan_of_price(price) -> str:
     price_id = _get(price, "id", default="")
     if PRICE_CREATOR and price_id == PRICE_CREATOR:
         return PLAN_CREATOR
+    if PRICE_AFFILIATE and price_id == PRICE_AFFILIATE:
+        return PLAN_AFFILIATE
     if PRICE_GENERAL and price_id == PRICE_GENERAL:
         return PLAN_GENERAL
     return _PLAN_BY_AMOUNT.get(_get(price, "unit_amount", default=0), "")
@@ -265,8 +279,8 @@ def _active_subscription_of(customer_id: str):
     alive = [s for s in subs.auto_paging_iter() if _get(s, "status") in ("active", "trialing", "past_due")]
     if not alive:
         return None
-    # チャンネル作成プランを優先する
-    alive.sort(key=lambda s: _plan_of_subscription(s) != PLAN_CREATOR)
+    # 紹介特典を受け取れるプランを優先する
+    alive.sort(key=lambda s: _referrer_rank(_plan_of_subscription(s)))
     return alive[0]
 
 
@@ -280,9 +294,9 @@ def _referrer_customer(code_row: dict):
     for customer in customers.auto_paging_iter():
         sub = _active_subscription_of(customer["id"])
         if sub is not None:
-            if _plan_of_subscription(sub) == PLAN_CREATOR:
+            if _plan_of_subscription(sub) in REFERRER_PLANS:
                 return customer, sub
-            if best[0] is None:
+            if best[0] is None or best[1] is None:
                 best = (customer, sub)
         elif best[0] is None:
             best = (customer, None)
@@ -455,7 +469,7 @@ def _record_invoice(invoice):
         "StripeサブスクリプションID": subscription_id,
     }
 
-    # 支払った時点で、紹介者がチャンネル作成プランか確かめる（規約：一般プランの紹介者には報酬なし）
+    # 支払った時点で、紹介者が紹介特典の対象プランか確かめる（規約：一般プランの紹介者には報酬なし）
     referrer, referrer_sub = _referrer_customer(code_row)
     if not item["報酬額"]:
         item.update({"状態": STATUS_EXCLUDED, "メモ": f"プランを判別できません（{plan}）"})
@@ -464,8 +478,8 @@ def _record_invoice(invoice):
     elif referrer is None:
         # メールアドレスの間違いなどもあり得るので、付与日に改めて確かめる
         item["メモ"] = "紹介者のStripeの契約が見つかりません（付与日に再確認）"
-    elif referrer_sub is None or _plan_of_subscription(referrer_sub) != PLAN_CREATOR:
-        item.update({"状態": STATUS_EXCLUDED, "メモ": "紹介者がチャンネル作成プランではありません"})
+    elif referrer_sub is None or _plan_of_subscription(referrer_sub) not in REFERRER_PLANS:
+        item.update({"状態": STATUS_EXCLUDED, "メモ": _NOT_REFERRER_PLAN})
     _append(SHEET_REWARDS, item)
 
 
@@ -503,8 +517,8 @@ def grant_due_rewards() -> dict:
                 if referrer is None or referrer_sub is None:
                     row.update({"状態": STATUS_EXCLUDED, "メモ": "付与日に紹介者の契約が見つかりません（退会・メールアドレス違い）"})
                     result["excluded"] += 1
-                elif "紹介者のStripeの契約が見つかりません" in row["メモ"] and _plan_of_subscription(referrer_sub) != PLAN_CREATOR:
-                    row.update({"状態": STATUS_EXCLUDED, "メモ": "紹介者がチャンネル作成プランではありません"})
+                elif "紹介者のStripeの契約が見つかりません" in row["メモ"] and _plan_of_subscription(referrer_sub) not in REFERRER_PLANS:
+                    row.update({"状態": STATUS_EXCLUDED, "メモ": _NOT_REFERRER_PLAN})
                     result["excluded"] += 1
                 else:
                     amount = int(row["報酬額"] or 0)
