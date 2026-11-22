@@ -19,6 +19,7 @@ PANEL_TEXT = (
     "・一般プラン（2,200円）の方を紹介：月500円\n"
     "・チャンネル作成プラン（4,400円）の方を紹介：月1,000円\n"
     "特典は、紹介した方がお支払いした月の翌月末に、あなたの会費から差し引く形でお渡しします。\n"
+    "会費（1回分）を超える分は、運営から月に1回まとめて口座に振り込みます。\n"
     "（一般プランの方も紹介リンクは発行できますが、紹介特典は発生しません）\n\n"
     f"くわしくは紹介制度規約をご覧ください：https://resense-inc.com/legal/referral.html"
 )
@@ -32,7 +33,9 @@ def _member_text(row: dict, summary: dict) -> str:
         f"紹介コード：`{row['紹介コード']}`\n\n"
         f"・特典を受け取るStripeのメールアドレス：{email}\n"
         f"・紹介して入会した方：{summary['referred']}人\n"
-        f"・お渡し済みの特典：{summary['granted']:,}円／お渡し予定の特典：{summary['scheduled']:,}円\n\n"
+        f"・お渡し済みの特典：{summary['granted']:,}円"
+        f"（会費から差し引き {summary['credit']:,}円／口座への振込 {summary['transfer']:,}円）\n"
+        f"・お渡し予定の特典：{summary['scheduled']:,}円\n\n"
         "このリンクを、紹介したい方に送ってください。リンクから入会すると、あなたの紹介として記録されます。"
     )
 

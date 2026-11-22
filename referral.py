@@ -13,6 +13,8 @@
    ・invoice.paid              → 「紹介報酬」：紹介された人が払った月ごとに1行（付与は翌月末）
 4. 定期処理で、付与日（支払った月の翌月末）が来た報酬を、紹介者の Stripe の残高に
    クレジットとして入れる（＝次回の会費から自動で差し引かれる）。
+   ただし、クレジットは「次回の会費1回分」までにする。会費を超える分は「振込集計」シートに
+   月ごと・紹介者ごとにまとめ、運営が手で口座に振り込む（振り込んだら状態を「振込済み」にする）。
 
 【報酬のルール（紹介制度規約より）】
 ・紹介された人が一般プラン（2,200円）なら月500円、チャンネル作成プラン（4,400円）なら月1,000円
@@ -69,6 +71,9 @@ SHEET_CODES = "紹介コード"
 SHEET_REFERRALS = "紹介記録"
 SHEET_REWARDS = "紹介報酬"
 SHEET_SUBSCRIBERS = "契約者一覧"
+SHEET_TRANSFERS = "振込集計"
+
+TRANSFER_UNPAID = "未振込"
 
 _HEADERS = {
     SHEET_CODES: ["紹介コード", "DiscordID", "名前", "Stripeのメールアドレス", "発行日時", "更新日時"],
@@ -77,9 +82,10 @@ _HEADERS = {
         "プラン", "StripeサブスクリプションID", "Stripe顧客ID",
     ],
     SHEET_REWARDS: [
-        "支払日", "紹介コード", "紹介者", "入会した人", "プラン", "報酬額", "付与予定日", "状態",
-        "付与日", "メモ", "Stripe請求書ID", "StripeサブスクリプションID",
+        "支払日", "紹介コード", "紹介者", "入会した人", "プラン", "報酬額", "会費から差し引き", "振込",
+        "付与予定日", "状態", "付与日", "メモ", "Stripe請求書ID", "StripeサブスクリプションID",
     ],
+    SHEET_TRANSFERS: ["付与月", "紹介コード", "紹介者", "DiscordID", "振込額", "状態", "振込日", "メモ"],
     SHEET_SUBSCRIBERS: [
         "Stripe顧客ID", "名前", "メールアドレス", "プラン", "状態", "開始日", "解約日",
         "紹介コード", "StripeサブスクリプションID", "更新日時",
@@ -439,6 +445,8 @@ def _record_invoice(invoice):
         "入会した人": _get(customer, "name", default="") or _get(customer, "email", default=""),
         "プラン": plan,
         "報酬額": REWARD_BY_PLAN.get(plan, 0),
+        "会費から差し引き": "",
+        "振込": "",
         "付与予定日": _end_of_next_month(int(paid_at)),
         "状態": STATUS_SCHEDULED,
         "付与日": "",
@@ -465,12 +473,27 @@ def _record_invoice(invoice):
 # 報酬の付与（定期処理・管理者コマンドから呼ぶ）
 # ---------------------------------------------------------------------------
 
+def _monthly_fee(subscription) -> int:
+    """紹介者の毎月の会費（クレジットの上限に使う）。"""
+    for item in _get(subscription, "items", "data", default=[]) or []:
+        amount = _get(item, "price", "unit_amount", default=0) or 0
+        if amount:
+            return int(amount) * int(_get(item, "quantity", default=1) or 1)
+    return 4400
+
+
 def grant_due_rewards() -> dict:
-    """付与予定日が来た報酬を、紹介者の Stripe の残高にクレジットとして入れる。"""
-    result = {"granted": 0, "amount": 0, "excluded": 0, "errors": []}
+    """
+    付与予定日が来た報酬を渡す。
+    ・紹介者の Stripe の残高にクレジットとして入れる（次回の会費から差し引かれる）。ただし、
+      まだ使われていないクレジットと合わせて「会費1回分」までにする
+    ・会費を超える分は「振込」として記録し、「振込集計」シートに月ごと・紹介者ごとにまとめる
+    """
+    result = {"granted": 0, "amount": 0, "credit": 0, "transfer": 0, "excluded": 0, "errors": []}
     today = datetime.now(JST).strftime("%Y-%m-%d")
     with _lock:
         codes = {r["紹介コード"]: r for r in _rows(SHEET_CODES)}
+        outstanding: dict[str, int] = {}  # 紹介者の顧客ID → まだ使われていないクレジット（円）
         for row in _rows(SHEET_REWARDS):
             if row["状態"] != STATUS_SCHEDULED or not row["付与予定日"] or row["付与予定日"] > today:
                 continue
@@ -485,22 +508,64 @@ def grant_due_rewards() -> dict:
                     result["excluded"] += 1
                 else:
                     amount = int(row["報酬額"] or 0)
-                    _stripe().Customer.create_balance_transaction(
-                        referrer["id"],
-                        amount=-amount,  # マイナス＝クレジット（次回の会費から差し引かれる）
-                        currency="jpy",
-                        description=f"紹介特典（{row['入会した人']}さん・{row['支払日']}のお支払い分）",
-                        metadata={"invoice": row["Stripe請求書ID"]},
-                        idempotency_key=f"referral-reward-{row['Stripe請求書ID']}",  # 二重に付与しない
-                    )
-                    row.update({"状態": STATUS_GRANTED, "付与日": today, "メモ": ""})
+                    if referrer["id"] not in outstanding:
+                        balance = _get(_customer(referrer["id"]), "balance", default=0) or 0
+                        outstanding[referrer["id"]] = max(0, -int(balance))  # マイナスの残高＝クレジット
+                    room = max(0, _monthly_fee(referrer_sub) - outstanding[referrer["id"]])
+                    credit = min(amount, room)
+                    transfer = amount - credit
+                    if credit:
+                        _stripe().Customer.create_balance_transaction(
+                            referrer["id"],
+                            amount=-credit,  # マイナス＝クレジット（次回の会費から差し引かれる）
+                            currency="jpy",
+                            description=f"紹介特典（{row['入会した人']}さん・{row['支払日']}のお支払い分）",
+                            metadata={"invoice": row["Stripe請求書ID"]},
+                            idempotency_key=f"referral-reward-{row['Stripe請求書ID']}",  # 二重に付与しない
+                        )
+                        outstanding[referrer["id"]] += credit
+                    row.update({
+                        "状態": STATUS_GRANTED, "付与日": today, "会費から差し引き": credit, "振込": transfer,
+                        "メモ": "会費を超える分は振込" if transfer else "",
+                    })
                     result["granted"] += 1
                     result["amount"] += amount
+                    result["credit"] += credit
+                    result["transfer"] += transfer
             except Exception as error:  # noqa: BLE001 - 1件失敗しても続ける（次回また試す）
                 row.update({"状態": STATUS_SCHEDULED, "メモ": f"付与エラー（次回再試行）：{error}"[:300]})
                 result["errors"].append(f"{row['紹介者']}：{error}")
             _update(SHEET_REWARDS, row["_row"], row)
+        _rebuild_transfers(codes)
     return result
+
+
+def _rebuild_transfers(codes: dict[str, dict]):
+    """
+    「紹介報酬」の振込の分を、付与した月・紹介者ごとに合計して「振込集計」シートに書く。
+    毎回「紹介報酬」から計算し直すので、途中で止まっても合計がずれない。
+    運営が書き込んだ「状態」「振込日」「メモ」はそのまま残す。
+    """
+    totals: dict[tuple[str, str], int] = {}
+    for row in _rows(SHEET_REWARDS):
+        amount = int(row["振込"] or 0) if str(row["振込"]).strip().lstrip("-").isdigit() else 0
+        if row["状態"] == STATUS_GRANTED and amount > 0 and row["付与日"]:
+            key = (row["付与日"][:7], row["紹介コード"])
+            totals[key] = totals.get(key, 0) + amount
+    existing = {(r["付与月"], r["紹介コード"]): r for r in _rows(SHEET_TRANSFERS)}
+    for (month, code), amount in sorted(totals.items()):
+        code_row = codes.get(code, {})
+        row = existing.get((month, code))
+        if row is None:
+            _append(SHEET_TRANSFERS, {
+                "付与月": month, "紹介コード": code, "紹介者": code_row.get("名前", ""),
+                "DiscordID": code_row.get("DiscordID", ""), "振込額": amount, "状態": TRANSFER_UNPAID,
+            })
+        elif str(row["振込額"]) != str(amount):
+            if row["状態"] and row["状態"] != TRANSFER_UNPAID:
+                row["メモ"] = (f"振込額が {row['振込額']}円 → {amount}円 に変わりました。差額をご確認ください。 " + row["メモ"])[:300]
+            row["振込額"] = amount
+            _update(SHEET_TRANSFERS, row["_row"], row)
 
 
 def sync_all_subscriptions() -> int:
@@ -519,12 +584,14 @@ def member_summary(discord_id: str) -> dict:
     with _lock:
         mine = get_code_for_member(discord_id)
         if mine is None:
-            return {"referred": 0, "granted": 0, "scheduled": 0}
+            return {"referred": 0, "granted": 0, "credit": 0, "transfer": 0, "scheduled": 0}
         code = mine["紹介コード"]
         referred = sum(1 for r in _rows(SHEET_REFERRALS) if r["紹介コード"] == code)
         rewards = [r for r in _rows(SHEET_REWARDS) if r["紹介コード"] == code]
     return {
         "referred": referred,
         "granted": sum(int(r["報酬額"] or 0) for r in rewards if r["状態"] == STATUS_GRANTED),
+        "credit": sum(int(r["会費から差し引き"] or 0) for r in rewards if r["状態"] == STATUS_GRANTED),
+        "transfer": sum(int(r["振込"] or 0) for r in rewards if r["状態"] == STATUS_GRANTED),
         "scheduled": sum(int(r["報酬額"] or 0) for r in rewards if r["状態"] == STATUS_SCHEDULED),
     }

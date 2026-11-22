@@ -1539,7 +1539,10 @@ async def grant_referral_rewards():
         print(f"紹介特典の付与でエラー：{error}")
         return
     if result["granted"] or result["excluded"] or result["errors"]:
-        print(f"紹介特典：付与{result['granted']}件（{result['amount']}円）／対象外{result['excluded']}件／エラー{len(result['errors'])}件")
+        print(
+            f"紹介特典：付与{result['granted']}件（{result['amount']}円、うち振込{result['transfer']}円）"
+            f"／対象外{result['excluded']}件／エラー{len(result['errors'])}件"
+        )
 
 
 @bot.command(name="紹介パネル設置")
@@ -1570,6 +1573,8 @@ async def run_referral_rewards(ctx: commands.Context):
         return
     lines = [
         f"✅ 紹介特典を {result['granted']} 件（合計 {result['amount']:,} 円）付与しました。",
+        f"・会費から差し引き：{result['credit']:,} 円／会費を超えた分（振込）：{result['transfer']:,} 円"
+        f"（振込の合計はスプレッドシートの「{referral.SHEET_TRANSFERS}」）",
         f"・対象外にしたもの：{result['excluded']} 件（理由はスプレッドシートの「{referral.SHEET_REWARDS}」のメモ欄）",
     ]
     if result["errors"]:
