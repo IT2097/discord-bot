@@ -17,10 +17,10 @@
    月ごと・紹介者ごとにまとめ、運営が手で口座に振り込む（振り込んだら状態を「振込済み」にする）。
 
 【報酬のルール（紹介制度規約より）】
-・紹介された人のプランで、一般プラン（2,200円）なら月500円、アフィリエイトプラン（3,300円）なら月750円、
-  チャンネル作成プラン（4,400円）なら月1,000円
+・紹介された人のプランで、スタンダードプラン（2,200円）なら月500円、アフィリエイトプラン（3,300円）なら月750円、
+  プレミアムプラン（4,400円）なら月1,000円
 ・報酬を受け取れるのは、紹介された人が支払った時点で、紹介者がアフィリエイトプランか
-  チャンネル作成プランの会員のときだけ（一般プランの会員の紹介は記録だけ残す）
+  プレミアムプランの会員のときだけ（スタンダードプランの会員の紹介は記録だけ残す）
 ・付与する時点で紹介者が退会していたら付与しない
 ・紹介者本人による入会は対象外
 
@@ -61,13 +61,13 @@ PRICE_AFFILIATE = os.getenv("STRIPE_PRICE_AFFILIATE", "")
 PRICE_CREATOR = os.getenv("STRIPE_PRICE_CREATOR", "")
 REFERRAL_LINK_BASE = os.getenv("REFERRAL_LINK_BASE", "https://resense-inc.com/reje/")
 
-PLAN_GENERAL = "一般プラン"
+PLAN_GENERAL = "スタンダードプラン"
 PLAN_AFFILIATE = "アフィリエイトプラン"
-PLAN_CREATOR = "チャンネル作成プラン"
+PLAN_CREATOR = "プレミアムプラン"
 REWARD_BY_PLAN = {PLAN_GENERAL: 500, PLAN_AFFILIATE: 750, PLAN_CREATOR: 1000}
 _PLAN_BY_AMOUNT = {2200: PLAN_GENERAL, 3300: PLAN_AFFILIATE, 4400: PLAN_CREATOR}
 REFERRER_PLANS = (PLAN_CREATOR, PLAN_AFFILIATE)  # 紹介特典を受け取れるプラン（先にあるほど優先）
-_NOT_REFERRER_PLAN = "紹介者が紹介特典の対象プラン（アフィリエイト・チャンネル作成）ではありません"
+_NOT_REFERRER_PLAN = "紹介者が紹介特典の対象プラン（アフィリエイト・プレミアム）ではありません"
 
 
 def _referrer_rank(plan: str) -> int:
@@ -469,7 +469,7 @@ def _record_invoice(invoice):
         "StripeサブスクリプションID": subscription_id,
     }
 
-    # 支払った時点で、紹介者が紹介特典の対象プランか確かめる（規約：一般プランの紹介者には報酬なし）
+    # 支払った時点で、紹介者が紹介特典の対象プランか確かめる（規約：スタンダードプランの紹介者には報酬なし）
     referrer, referrer_sub = _referrer_customer(code_row)
     if not item["報酬額"]:
         item.update({"状態": STATUS_EXCLUDED, "メモ": f"プランを判別できません（{plan}）"})
@@ -496,6 +496,34 @@ def _monthly_fee(subscription) -> int:
     return 4400
 
 
+def _invoice_refunded(invoice_id: str) -> bool:
+    """請求書の支払いが返金・取り消しされたか（紹介制度規約 第4条：返金された決済の特典は発生しない）。"""
+    invoice = _stripe().Invoice.retrieve(invoice_id)
+    if _get(invoice, "status") in ("void", "uncollectible"):
+        return True
+    charge_ids = []
+    if _get(invoice, "charge"):  # 古いAPIのバージョン
+        charge_ids.append(invoice["charge"])
+    else:  # 新しいAPIのバージョンでは、請求書の支払い（InvoicePayment）からたどる
+        try:
+            for payment in _stripe().InvoicePayment.list(invoice=invoice_id, limit=10).data:
+                charge = _get(payment, "payment", "charge")
+                intent = _get(payment, "payment", "payment_intent")
+                if charge:
+                    charge_ids.append(charge)
+                elif intent:
+                    latest = _get(_stripe().PaymentIntent.retrieve(intent), "latest_charge")
+                    if latest:
+                        charge_ids.append(latest)
+        except Exception as error:  # noqa: BLE001 - 確かめられないときは返金なしとして続ける
+            print(f"請求書 {invoice_id} の支払いを確認できませんでした：{error}")
+    for charge_id in charge_ids:
+        charge = _stripe().Charge.retrieve(charge_id)
+        if _get(charge, "refunded") or (_get(charge, "amount_refunded", default=0) or 0) > 0:
+            return True
+    return False
+
+
 def grant_due_rewards() -> dict:
     """
     付与予定日が来た報酬を渡す。
@@ -516,6 +544,9 @@ def grant_due_rewards() -> dict:
                 referrer, referrer_sub = _referrer_customer(code_row) if code_row else (None, None)
                 if referrer is None or referrer_sub is None:
                     row.update({"状態": STATUS_EXCLUDED, "メモ": "付与日に紹介者の契約が見つかりません（退会・メールアドレス違い）"})
+                    result["excluded"] += 1
+                elif row["Stripe請求書ID"] and _invoice_refunded(row["Stripe請求書ID"]):
+                    row.update({"状態": STATUS_EXCLUDED, "メモ": "紹介された方の決済が返金・取り消しされました"})
                     result["excluded"] += 1
                 elif "紹介者のStripeの契約が見つかりません" in row["メモ"] and _plan_of_subscription(referrer_sub) not in REFERRER_PLANS:
                     row.update({"状態": STATUS_EXCLUDED, "メモ": _NOT_REFERRER_PLAN})
