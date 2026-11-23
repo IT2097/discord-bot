@@ -49,7 +49,7 @@ class EmailModal(discord.ui.Modal, title="紹介リンクの発行"):
         super().__init__()
         self.email = discord.ui.TextInput(
             label="リジェの会費を支払っているStripeのメールアドレス",
-            placeholder="例：taro@example.com（会費免除の方は空欄でOK）",
+            placeholder="例：taro@example.com",
             default=current_email or None,
             required=False,
             max_length=200,
