@@ -88,7 +88,7 @@ SHEET_TRANSFERS = "振込集計"
 TRANSFER_UNPAID = "未振込"
 
 _HEADERS = {
-    SHEET_CODES: ["紹介コード", "DiscordID", "名前", "Stripeのメールアドレス", "発行日時", "更新日時"],
+    SHEET_CODES: ["紹介コード", "DiscordID", "名前", "Stripeのメールアドレス", "発行日時", "更新日時", "会費免除"],
     SHEET_REFERRALS: [
         "入会日時", "紹介コード", "紹介者", "紹介者DiscordID", "入会した人", "入会した人のメール",
         "プラン", "StripeサブスクリプションID", "Stripe顧客ID",
@@ -169,6 +169,14 @@ def _sheet(name: str) -> gspread.Worksheet:
             headers = _HEADERS[name]
             sheet = spreadsheet.add_worksheet(title=name, rows=1000, cols=len(headers))
             sheet.append_row(headers, value_input_option="RAW")
+        else:
+            # 列を後から足したときは、見出しの行も足す（今ある行の中身はそのまま）
+            current = sheet.row_values(1)
+            headers = _HEADERS[name]
+            if len(current) < len(headers):
+                if sheet.col_count < len(headers):
+                    sheet.add_cols(len(headers) - sheet.col_count)
+                sheet.update(range_name="A1", values=[headers], value_input_option="RAW")
         _sheets[name] = sheet
         return sheet
 
@@ -203,6 +211,15 @@ def _update(name: str, row_number: int, item: dict):
 # ---------------------------------------------------------------------------
 # 紹介コード（Discord のボタンから使う）
 # ---------------------------------------------------------------------------
+
+def is_exempt(code_row: dict | None) -> bool:
+    """
+    会費免除の紹介者か（「紹介コード」シートの「会費免除」列に「はい」などが入っている人）。
+    会費を払っていないので Stripe の契約は確かめず、紹介特典は全額を振込にする。
+    """
+    value = str((code_row or {}).get("会費免除", "")).strip().lower()
+    return value in ("はい", "○", "◯", "yes", "true", "1", "免除")
+
 
 def referral_link(code: str) -> str:
     sep = "&" if "?" in REFERRAL_LINK_BASE else "?"
@@ -469,6 +486,15 @@ def _record_invoice(invoice):
         "StripeサブスクリプションID": subscription_id,
     }
 
+    if is_exempt(code_row):
+        # 会費免除の紹介者：Stripeの契約は確かめない（付与日に全額を振込にする）
+        if not item["報酬額"]:
+            item.update({"状態": STATUS_EXCLUDED, "メモ": f"プランを判別できません（{plan}）"})
+        else:
+            item["メモ"] = "会費免除の紹介者（全額振込）"
+        _append(SHEET_REWARDS, item)
+        return
+
     # 支払った時点で、紹介者が紹介特典の対象プランか確かめる（規約：スタンダードプランの紹介者には報酬なし）
     referrer, referrer_sub = _referrer_customer(code_row)
     if not item["報酬額"]:
@@ -541,6 +567,22 @@ def grant_due_rewards() -> dict:
                 continue
             code_row = codes.get(row["紹介コード"])
             try:
+                if is_exempt(code_row):
+                    # 会費免除の紹介者：会費から差し引けないので、全額を振込にする
+                    if row["Stripe請求書ID"] and _invoice_refunded(row["Stripe請求書ID"]):
+                        row.update({"状態": STATUS_EXCLUDED, "メモ": "紹介された方の決済が返金・取り消しされました"})
+                        result["excluded"] += 1
+                    else:
+                        amount = int(row["報酬額"] or 0)
+                        row.update({
+                            "状態": STATUS_GRANTED, "付与日": today, "会費から差し引き": 0, "振込": amount,
+                            "メモ": "会費免除の紹介者（全額振込）",
+                        })
+                        result["granted"] += 1
+                        result["amount"] += amount
+                        result["transfer"] += amount
+                    _update(SHEET_REWARDS, row["_row"], row)
+                    continue
                 referrer, referrer_sub = _referrer_customer(code_row) if code_row else (None, None)
                 if referrer is None or referrer_sub is None:
                     row.update({"状態": STATUS_EXCLUDED, "メモ": "付与日に紹介者の契約が見つかりません（退会・メールアドレス違い）"})
