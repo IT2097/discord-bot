@@ -27,7 +27,10 @@ PANEL_TEXT = (
 
 
 def _member_text(row: dict, summary: dict) -> str:
-    email = row.get("Stripeのメールアドレス") or "（未登録：特典を受け取るには登録してください）"
+    if referral.is_exempt(row):
+        email = "（会費免除のため不要。紹介特典は全額を口座に振り込みます）"
+    else:
+        email = row.get("Stripeのメールアドレス") or "（未登録：特典を受け取るには登録してください）"
     return (
         "🎁 **あなたの紹介リンク**（あなたにだけ表示されています）\n"
         f"{referral.referral_link(row['紹介コード'])}\n"
@@ -46,8 +49,9 @@ class EmailModal(discord.ui.Modal, title="紹介リンクの発行"):
         super().__init__()
         self.email = discord.ui.TextInput(
             label="リジェの会費を支払っているStripeのメールアドレス",
-            placeholder="例：taro@example.com",
+            placeholder="例：taro@example.com（会費免除の方は空欄でOK）",
             default=current_email or None,
+            required=False,
             max_length=200,
         )
         self.add_item(self.email)
