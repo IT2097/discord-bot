@@ -12,7 +12,7 @@
     承認すると、カテゴリの中にフォーラムができ、主（リクエストした人）だけが投稿を作れる。
     告知は、既存の仕組み（概要と主がそろったら「チャンネル紹介」に自動で告知）がそのまま行う。
 
-リクエストを送れるのは、4000円プランのロール（PREMIUM_ROLE_NAME、標準は「⭐️」）の人と管理者だけ。
+リクエストを送れるのは、プレミアムプラン（月額4,400円）のロール（PREMIUM_ROLE_NAME、標準は「🌟」）の人と管理者だけ。
 承認待ちのリクエストは1人1件まで。リクエストは、管理者だけが見られる「リクエスト」チャンネルに届く。
 リクエストの中身は管理者向けメッセージに書いておくので、botが再起動しても承認・却下ボタンはそのまま使える。
 """
@@ -28,7 +28,7 @@ COMMUNITY_CATEGORY_NAME = os.getenv("COMMUNITY_CATEGORY_NAME", "コミュニテ�
 OWNER_FORUM_CATEGORY_NAME = os.getenv("OWNER_FORUM_CATEGORY_NAME", "発信チャンネル")
 REQUEST_ADMIN_CHANNEL_NAME = os.getenv("FORUM_REQUEST_CHANNEL_NAME", "リクエスト")
 NOTICE_CHANNEL_NAME = os.getenv("COMMUNITY_NOTICE_CHANNEL_NAME", "チャンネル紹介")
-PREMIUM_ROLE_NAME = os.getenv("PREMIUM_ROLE_NAME", "⭐️").strip()
+PREMIUM_ROLE_NAME = os.getenv("PREMIUM_ROLE_NAME", "🌟").strip()
 ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "管理者")
 MEMBER_ROLE_NAME = os.getenv("MEMBER_ROLE_NAME", "会員")
 UNVERIFIED_ROLE_NAME = os.getenv("UNVERIFIED_ROLE_NAME", "未登録")
@@ -149,7 +149,7 @@ async def _check_can_open(interaction: discord.Interaction) -> discord.TextChann
     member = interaction.user
     if not isinstance(member, discord.Member) or not _can_request(member):
         await interaction.response.send_message(
-            "作成のリクエストは、コミュニティ作成プラン（⭐️）の方だけが送れます。", ephemeral=True
+            "作成のリクエストは、プレミアムプラン（🌟）の方だけが送れます。", ephemeral=True
         )
         return None
     admin_channel = _admin_channel(interaction.guild)
@@ -644,11 +644,11 @@ POST_PANEL_TEXT = (
     "📝 **コミュニティの枠の作成リクエスト**\n"
     "「趣味」「在宅ワーク」などに新しい枠（例：「ポーカー」）を作りたいときは、下のボタンからリクエストしてください。\n"
     "作る場所・枠の名前・説明を入力して送ると、運営が確認します。承認されると、あなたの名前で枠が作られ、チャンネル紹介でお知らせします。\n"
-    "※リクエストできるのは、コミュニティ作成プラン（⭐️）の方です"
+    "※リクエストできるのは、プレミアムプラン（🌟）の方です"
 )
 CHANNEL_PANEL_TEXT = (
     "📝 **発信チャンネルの作成リクエスト**\n"
     "あなたが主になって発信するチャンネルを作りたいときは、下のボタンからリクエストしてください。\n"
     "チャンネルの名前と説明を入力して送ると、運営が確認します。承認されると、あなたが主のチャンネルが作られ、チャンネル紹介でお知らせします。\n"
-    "※リクエストできるのは、コミュニティ作成プラン（⭐️）の方です"
+    "※リクエストできるのは、プレミアムプラン（🌟）の方です"
 )

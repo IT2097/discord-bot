@@ -114,6 +114,70 @@ class ReferralPanel(discord.ui.View):
         await _report_error(interaction, error)
 
 
+PLAN_TEXT = (
+    "📋 **リジェコミュニティ プラン一覧**\n\n"
+    "**スタンダードプラン**　月額2,200円（税込）\n"
+    "・コミュニティへの参加（会員同士のマッチング・交流）\n"
+    "・勉強会・イベントへの参加\n"
+    "・限定情報の受け取り\n\n"
+    "**⭐️ アフィリエイトプラン**　月額3,300円（税込）\n"
+    "・スタンダードプランのすべての内容\n"
+    "・紹介特典の受け取り（紹介した方が続けている間、毎月500〜1,000円）\n\n"
+    "**🌟 プレミアムプラン**　月額4,400円（税込）\n"
+    "・アフィリエイトプランのすべての内容\n"
+    "・専用チャンネル（コミュニティの枠・発信チャンネル）の作成・運営\n"
+    "・コミュニティ内での発信・集客\n\n"
+    "下の「プランを変更する」ボタンから、プランの変更（アップグレード・ダウングレード）ができます。\n"
+    "変更すると、Discordのロール（⭐️・🌟）も自動で切り替わります。\n"
+    "変更後の料金（日割りなど）は、変更の画面に表示されます。"
+)
+
+
+class PlanChangePanel(discord.ui.View):
+    """「プラン変更」チャンネルに置くボタン（再起動しても押せるよう custom_id を固定）。"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="プランを変更する", emoji="🔄", style=discord.ButtonStyle.primary, custom_id="plan_change_panel")
+    async def open(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not referral.is_configured():
+            await interaction.followup.send("ただいま準備中です。運営にお問い合わせください。", ephemeral=True)
+            return
+        guild_id = interaction.guild.id if interaction.guild else ""
+        return_url = f"https://discord.com/channels/{guild_id}/{interaction.channel_id}"
+        url = await asyncio.to_thread(referral.portal_url_for, str(interaction.user.id), return_url)
+        view = discord.ui.View()
+        if url:
+            view.add_item(discord.ui.Button(label="プラン変更の画面を開く", url=url, emoji="🔄"))
+            await interaction.followup.send(
+                "下のボタンから、プラン変更の画面（Stripe）を開けます。\n"
+                "（このボタンは数分で使えなくなります。使えないときは、もう一度「プランを変更する」を押してください）",
+                ephemeral=True,
+                view=view,
+            )
+            return
+        if referral.PORTAL_LOGIN_URL:
+            view.add_item(discord.ui.Button(label="会員さま専用ページを開く", url=referral.PORTAL_LOGIN_URL))
+            await interaction.followup.send(
+                "お申し込みとDiscordアカウントの結び付けが見つかりませんでした。\n"
+                "下の「会員さま専用ページ」で、お申し込みに使ったメールアドレスを入力すると、"
+                "届いたメールからプランを変更できます。\n"
+                "（この方法で変更した場合、Discordのロールは運営が切り替えます）",
+                ephemeral=True,
+                view=view,
+            )
+            return
+        await interaction.followup.send(
+            "お申し込みとDiscordアカウントの結び付けが見つかりませんでした。お手数ですが運営にお問い合わせください。",
+            ephemeral=True,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        await _report_error(interaction, error)
+
+
 async def _report_error(interaction: discord.Interaction, error: Exception):
     import traceback
 

@@ -60,6 +60,11 @@ PRICE_GENERAL = os.getenv("STRIPE_PRICE_GENERAL", "")
 PRICE_AFFILIATE = os.getenv("STRIPE_PRICE_AFFILIATE", "")
 PRICE_CREATOR = os.getenv("STRIPE_PRICE_CREATOR", "")
 REFERRAL_LINK_BASE = os.getenv("REFERRAL_LINK_BASE", "https://resense-inc.com/reje/")
+# 会員が自分でプラン変更・解約できる Stripe のカスタマーポータルのログインURL（任意。Discordと契約が結び付いていない人向け）
+PORTAL_LOGIN_URL = os.getenv("STRIPE_PORTAL_LOGIN_URL", "")
+# プランごとに付ける Discord のロール（スタンダードはロールなし）
+AFFILIATE_ROLE_NAME = os.getenv("AFFILIATE_ROLE_NAME", "⭐️").strip()
+PREMIUM_ROLE_NAME = os.getenv("PREMIUM_ROLE_NAME", "🌟").strip()
 
 PLAN_GENERAL = "スタンダードプラン"
 PLAN_AFFILIATE = "アフィリエイトプラン"
@@ -100,7 +105,7 @@ _HEADERS = {
     SHEET_TRANSFERS: ["付与月", "紹介コード", "紹介者", "DiscordID", "振込額", "状態", "振込日", "メモ"],
     SHEET_SUBSCRIBERS: [
         "Stripe顧客ID", "名前", "メールアドレス", "プラン", "状態", "開始日", "解約日",
-        "紹介コード", "StripeサブスクリプションID", "更新日時",
+        "紹介コード", "StripeサブスクリプションID", "更新日時", "DiscordID",
     ],
 }
 
@@ -397,14 +402,96 @@ def _record_subscription(subscription):
         "紹介コード": _get(subscription, "metadata", "referral_code", default=""),
         "StripeサブスクリプションID": subscription["id"],
         "更新日時": _now_text(),
+        "DiscordID": _get(subscription, "metadata", "discord_id", default=""),
     }
     existing = next((r for r in _rows(SHEET_SUBSCRIBERS) if r["StripeサブスクリプションID"] == subscription["id"]), None)
     if existing is not None:
         if not item["紹介コード"]:
             item["紹介コード"] = existing["紹介コード"]
+        if not item["DiscordID"]:
+            item["DiscordID"] = existing["DiscordID"]
         _update(SHEET_SUBSCRIBERS, existing["_row"], item)
     else:
         _append(SHEET_SUBSCRIBERS, item)
+    # Discordと結び付いている契約なら、プランに合わせてロールを付け外しする
+    if item["DiscordID"]:
+        _notify_roles(item["DiscordID"], item["プラン"], _get(subscription, "status") in _ALIVE_STATUSES)
+
+
+# ---------------------------------------------------------------------------
+# Discord との結び付け（決済後の参加・ロール・プラン変更）
+# ---------------------------------------------------------------------------
+
+_ALIVE_STATUSES = ("active", "trialing", "past_due")
+_role_hook = None  # bot.py が登録する：(DiscordID, プラン, 契約が続いているか) を受け取ってロールを付け外しする
+
+
+def set_role_hook(func):
+    global _role_hook
+    _role_hook = func
+
+
+def _notify_roles(discord_id: str, plan: str, alive: bool):
+    if _role_hook is None:
+        return
+    try:
+        _role_hook(str(discord_id), plan, alive)
+    except Exception as error:  # noqa: BLE001 - ロールの更新に失敗しても記録は続ける
+        print(f"ロールの更新を依頼できませんでした（{discord_id}）：{error}")
+
+
+def role_for_plan(plan: str) -> str:
+    """プランに付けるロールの名前（ロールなしなら空文字）。"""
+    return {PLAN_AFFILIATE: AFFILIATE_ROLE_NAME, PLAN_CREATOR: PREMIUM_ROLE_NAME}.get(plan, "")
+
+
+def checkout_join_info(session_id: str) -> dict:
+    """
+    決済が終わった Checkout の情報（決済後の「Discordに参加」ページ用）。
+    支払いが済んでいなければ ReferralError。
+    """
+    if not session_id or not session_id.startswith("cs_"):
+        raise ReferralError("お申し込みの情報が見つかりません。お手数ですが運営にお問い合わせください。")
+    session = _stripe().checkout.Session.retrieve(session_id)
+    subscription_id = _get(session, "subscription", default="")
+    if _get(session, "status") != "complete" or not subscription_id:
+        raise ReferralError("お支払いがまだ完了していません。完了してから、もう一度このページを開いてください。")
+    subscription = _stripe().Subscription.retrieve(subscription_id)
+    return {
+        "subscription_id": subscription_id,
+        "plan": _plan_of_subscription(subscription),
+        "discord_id": _get(subscription, "metadata", "discord_id", default=""),
+    }
+
+
+def link_discord(subscription_id: str, discord_id: str):
+    """契約に DiscordID を結び付ける（以後、プラン変更・解約に合わせてロールを自動で付け外しする）。"""
+    with _lock:
+        _stripe().Subscription.modify(subscription_id, metadata={"discord_id": str(discord_id)})
+        _record_subscription({"id": subscription_id})
+
+
+def portal_url_for(discord_id: str, return_url: str) -> str | None:
+    """
+    Discordと結び付いた契約の、プラン変更画面（Stripe のカスタマーポータル）のURL。
+    結び付いた契約が無ければ None（呼び出し側でポータルのログインURLを案内する）。
+    """
+    with _lock:
+        rows = [r for r in _rows(SHEET_SUBSCRIBERS) if r["DiscordID"] == str(discord_id)]
+    for row in reversed(rows):  # 新しい契約を優先
+        subscription = _stripe().Subscription.retrieve(row["StripeサブスクリプションID"])
+        if _get(subscription, "status") not in _ALIVE_STATUSES:
+            continue
+        session = _stripe().billing_portal.Session.create(
+            customer=subscription["customer"],
+            return_url=return_url,
+            flow_data={
+                "type": "subscription_update",
+                "subscription_update": {"subscription": subscription["id"]},
+            },
+        )
+        return session["url"]
+    return None
 
 
 def _record_checkout(session):
