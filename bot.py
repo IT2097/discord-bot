@@ -1558,6 +1558,83 @@ async def post_referral_panel(ctx: commands.Context):
         await ctx.send("⚠️ RailwayのVariablesに STRIPE_API_KEY が無いため、まだ紹介リンクを発行できません。", delete_after=60)
 
 
+async def sync_plan_roles(discord_id: str, plan: str, alive: bool):
+    """
+    Stripeの契約に合わせて、プランのロールを付け外しする。
+      アフィリエイトプラン → ⭐️、プレミアムプラン → 🌟、スタンダード・解約 → どちらも外す
+    """
+    guild_id = os.getenv("GUILD_ID")
+    guild = bot.get_guild(int(guild_id)) if guild_id else None
+    if guild is None:
+        return
+    member = guild.get_member(int(discord_id))
+    if member is None:
+        try:
+            member = await guild.fetch_member(int(discord_id))
+        except discord.HTTPException:
+            return  # まだサーバーにいない（参加したときに付ける）
+    wanted_name = referral.role_for_plan(plan) if alive else ""
+    plan_roles = [
+        role for role in guild.roles
+        if forum_request._norm(role.name) in {
+            forum_request._norm(referral.AFFILIATE_ROLE_NAME), forum_request._norm(referral.PREMIUM_ROLE_NAME)
+        }
+    ]
+    wanted = next((r for r in plan_roles if forum_request._norm(r.name) == forum_request._norm(wanted_name)), None)
+    remove = [r for r in plan_roles if r in member.roles and r != wanted]
+    try:
+        if remove:
+            await member.remove_roles(*remove, reason=f"Stripeの契約：{plan}（{'契約中' if alive else '解約'}）")
+        if wanted is not None and wanted not in member.roles:
+            await member.add_roles(wanted, reason=f"Stripeの契約：{plan}")
+    except discord.Forbidden:
+        print(f"プランのロールを付け外しする権限がありません（botのロールを⭐️・🌟より上にしてください）：{member}")
+    if wanted_name and wanted is None:
+        print(f"「{wanted_name}」という名前のロールが見つかりませんでした。")
+
+
+async def join_member_with_plan(discord_id: str, access_token: str, plan: str) -> str:
+    """
+    決済した人を、Discordのログイン（guilds.join）でサーバーに参加させ、プランのロールを付ける。
+    戻り値："joined"（参加させた）／"already"（もともと参加していた）
+    """
+    from discord.http import Route
+
+    guild_id = int(os.getenv("GUILD_ID"))
+    guild = bot.get_guild(guild_id)
+    role_name = referral.role_for_plan(plan)
+    role = next(
+        (r for r in guild.roles if forum_request._norm(r.name) == forum_request._norm(role_name)), None
+    ) if guild and role_name else None
+    payload = {"access_token": access_token}
+    if role is not None:
+        payload["roles"] = [str(role.id)]
+    result = await bot.http.request(
+        Route("PUT", "/guilds/{guild_id}/members/{user_id}", guild_id=guild_id, user_id=int(discord_id)),
+        json=payload,
+    )
+    joined = bool(result)  # 新しく参加したときはメンバー情報が返り、もともといたときは空が返る
+    if not joined:
+        await sync_plan_roles(discord_id, plan, True)  # もともといた人には、ここでロールを付ける
+    return "joined" if joined else "already"
+
+
+bot.join_member_with_plan = join_member_with_plan  # Webページ（web_app.py）から使う
+
+
+@bot.command(name="プラン変更設置")
+@is_admin()
+async def post_plan_change_panel(ctx: commands.Context):
+    """打ったチャンネルに、プランの説明と「プランを変更する」ボタンを置く管理者向けコマンド。"""
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
+    await ctx.send(referral_views.PLAN_TEXT, view=referral_views.PlanChangePanel())
+    if not referral.is_configured():
+        await ctx.send("⚠️ RailwayのVariablesに STRIPE_API_KEY が無いため、まだプラン変更の画面を開けません。", delete_after=60)
+
+
 @bot.command(name="紹介特典付与")
 @is_admin()
 async def run_referral_rewards(ctx: commands.Context):
@@ -2762,6 +2839,13 @@ async def on_ready():
     bot.add_view(MyRoomsView())
     bot.add_view(MyRequestsView())
     bot.add_view(referral_views.ReferralPanel())
+    bot.add_view(referral_views.PlanChangePanel())
+    # Stripeの契約が変わったら（Webhook＝Flaskのスレッド）、botのループでロールを付け外しする
+    referral.set_role_hook(
+        lambda discord_id, plan, alive: asyncio.run_coroutine_threadsafe(
+            sync_plan_roles(discord_id, plan, alive), bot_loop
+        )
+    )
     bot.add_view(profile_edit.ProfileEditPanel())
     bot.add_view(inquiry.InquiryPanel())
     bot.add_view(inquiry.InquiryResolveView())

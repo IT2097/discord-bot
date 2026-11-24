@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>エラー | マッチング会員一覧</title>
+  <title>{{ title or "エラー" }} | リジェコミュニティ</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <style>
     .error-account { display: flex; align-items: center; gap: 12px; margin: 20px auto 0; padding: 12px 16px; max-width: 360px; border-radius: 14px; background: rgba(255, 255, 255, 0.08); text-align: left; }
@@ -23,8 +23,8 @@
 <body>
   <div class="error-wrap">
     <div class="error-card">
-      <p class="eyebrow">Error</p>
-      <h1>うまくいきませんでした</h1>
+      <p class="eyebrow">{{ eyebrow or "Error" }}</p>
+      <h1>{{ title or "うまくいきませんでした" }}</h1>
       <p>{{ message }}</p>
 
       {% if account %}

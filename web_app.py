@@ -162,6 +162,82 @@ def create_app(bot, run_coro):
         query = "&".join(f"{k}={requests.utils.quote(str(v))}" for k, v in params.items())
         return redirect(f"{DISCORD_API_BASE}/oauth2/authorize?{query}")
 
+    # ------------------------------------------------------------------
+    # 決済後の「Discordに参加」（Stripe の料金表の確認ページからここへ移動させる）
+    #   /join?session_id={CHECKOUT_SESSION_ID}
+    #   → 「Discordでログインして参加」→ サーバーに参加させ、プランのロールを付ける
+    # ------------------------------------------------------------------
+    @app.route("/join")
+    def join():
+        session_id = request.args.get("session_id", "")
+        try:
+            info = referral.checkout_join_info(session_id)
+        except referral.ReferralError as error:
+            return render_template("error.html", message=str(error))
+        except Exception as error:  # noqa: BLE001
+            print(f"[参加ページ] 申し込みの確認に失敗：{error}")
+            return render_template("error.html", message="お申し込みの確認に失敗しました。少し待ってから、もう一度開いてください。")
+        session["join_session_id"] = session_id
+        role = referral.role_for_plan(info["plan"])
+        return render_template(
+            "error.html",
+            eyebrow="Welcome",
+            title="お申し込みありがとうございます",
+            message=f"{info['plan']}のお申し込みが完了しました。下のボタンからDiscordにログインすると、リジェコミュニティのサーバーに参加できます。",
+            hints=[
+                "Discordのアカウントをお持ちでない方は、ログインの画面から新しく作成できます。",
+                "いつもDiscordのアプリで使っているアカウントでログインしてください。",
+            ] + ([f"参加すると「{role}」のロールが自動で付きます。"] if role else []),
+            actions=[{"label": "Discordでログインして参加する", "href": url_for("join_login"), "primary": True}],
+        )
+
+    @app.route("/join/login")
+    def join_login():
+        if not session.get("join_session_id"):
+            return render_template("error.html", message="お申し込みの情報が見つかりません。決済完了の画面からもう一度お進みください。")
+        state = secrets.token_urlsafe(16)
+        session["oauth_state"] = state
+        session["oauth_purpose"] = "join"
+        params = {
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "response_type": "code",
+            "scope": "identify guilds.join",
+            "state": state,
+            "prompt": "consent",
+        }
+        query = "&".join(f"{k}={requests.utils.quote(str(v))}" for k, v in params.items())
+        return redirect(f"{DISCORD_API_BASE}/oauth2/authorize?{query}")
+
+    def _finish_join(discord_id: str, discord_name: str, access_token: str):
+        session_id = session.pop("join_session_id", "")
+        try:
+            info = referral.checkout_join_info(session_id)
+        except referral.ReferralError as error:
+            return render_template("error.html", message=str(error))
+        if info["discord_id"] and info["discord_id"] != discord_id:
+            return render_template(
+                "error.html",
+                message="このお申し込みは、すでに別のDiscordアカウントで参加済みです。心当たりがない場合は運営にお問い合わせください。",
+            )
+        try:
+            result = run_coro(_join_member(bot, discord_id, access_token, info["plan"]))
+        except Exception as error:  # noqa: BLE001
+            print(f"[参加ページ] サーバーへの参加に失敗：{discord_name}（{discord_id}）：{error}")
+            return render_template("error.html", message="サーバーへの参加に失敗しました。少し待ってから、もう一度お試しください。")
+        try:
+            referral.link_discord(info["subscription_id"], discord_id)
+        except Exception as error:  # noqa: BLE001 - 参加はできているので、記録の失敗はログだけ
+            print(f"[参加ページ] 契約とDiscordの結び付けに失敗：{discord_id}：{error}")
+        print(f"[参加ページ] {discord_name}（{discord_id}）：{info['plan']}・{result}")
+        return render_template(
+            "error.html",
+            eyebrow="Welcome",
+            title="参加が完了しました",
+            message="リジェコミュニティのサーバーに参加しました。下のボタンからDiscordを開いて、最初に「名前登録」をお願いします。",
+            actions=[{"label": "Discordを開く", "href": f"https://discord.com/channels/{GUILD_ID}", "primary": True}],
+        )
+
     @app.route("/callback")
     def callback():
         error = request.args.get("error")
@@ -204,6 +280,9 @@ def create_app(bot, run_coro):
         user_json = user_res.json()
         discord_id = user_json["id"]
         discord_name = user_json.get("global_name") or user_json.get("username")
+
+        if session.pop("oauth_purpose", "") == "join":
+            return _finish_join(discord_id, discord_name, access_token)
 
         # 対象サーバーのメンバーかどうかをBot経由で確認する
         try:
@@ -361,6 +440,11 @@ async def _avatar_urls(bot, discord_ids: list[str]) -> dict[str, str]:
             continue
         urls[str(discord_id)] = member.display_avatar.replace(size=128, static_format="png").url
     return urls
+
+
+async def _join_member(bot, discord_id: str, access_token: str, plan: str) -> str:
+    """bot.py の join_member_with_plan を呼ぶ（bot.py が bot に持たせている）。"""
+    return await bot.join_member_with_plan(discord_id, access_token, plan)
 
 
 async def _check_guild_membership(bot, discord_id: str) -> str:
