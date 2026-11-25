@@ -56,6 +56,12 @@ def create_app(bot, run_coro):
     """
     app = Flask(__name__)
     app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
+    # 決済後の参加では、どの申し込みかを Discord ログインの state に署名して入れて運ぶ。
+    # スマホでブラウザ → Discordアプリ → 別のブラウザ と切り替わり、Cookie が無くなっても参加できるようにするため
+    from itsdangerous import BadSignature, URLSafeTimedSerializer
+
+    join_signer = URLSafeTimedSerializer(app.secret_key, salt="join-oauth-state")
+    JOIN_STATE_MAX_AGE = 60 * 60  # 1時間以内にログインを終えてもらう
 
     def _missing_config():
         problems = []
@@ -177,7 +183,6 @@ def create_app(bot, run_coro):
         except Exception as error:  # noqa: BLE001
             print(f"[参加ページ] 申し込みの確認に失敗：{error}")
             return render_template("error.html", message="お申し込みの確認に失敗しました。少し待ってから、もう一度開いてください。")
-        session["join_session_id"] = session_id
         role = referral.role_for_plan(info["plan"])
         return render_template(
             "error.html",
@@ -188,16 +193,19 @@ def create_app(bot, run_coro):
                 "Discordのアカウントをお持ちでない方は、ログインの画面から新しく作成できます。",
                 "いつもDiscordのアプリで使っているアカウントでログインしてください。",
             ] + ([f"参加すると「{role}」のロールが自動で付きます。"] if role else []),
-            actions=[{"label": "Discordでログインして参加する", "href": url_for("join_login"), "primary": True}],
+            actions=[{
+                "label": "Discordでログインして参加する",
+                "href": url_for("join_login", session_id=session_id),
+                "primary": True,
+            }],
         )
 
     @app.route("/join/login")
     def join_login():
-        if not session.get("join_session_id"):
+        session_id = request.args.get("session_id", "")
+        if not session_id.startswith("cs_"):
             return render_template("error.html", message="お申し込みの情報が見つかりません。決済完了の画面からもう一度お進みください。")
-        state = secrets.token_urlsafe(16)
-        session["oauth_state"] = state
-        session["oauth_purpose"] = "join"
+        state = join_signer.dumps({"sid": session_id, "n": secrets.token_urlsafe(8)})
         params = {
             "client_id": CLIENT_ID,
             "redirect_uri": REDIRECT_URI,
@@ -209,8 +217,15 @@ def create_app(bot, run_coro):
         query = "&".join(f"{k}={requests.utils.quote(str(v))}" for k, v in params.items())
         return redirect(f"{DISCORD_API_BASE}/oauth2/authorize?{query}")
 
-    def _finish_join(discord_id: str, discord_name: str, access_token: str):
-        session_id = session.pop("join_session_id", "")
+    def _join_session_from_state(state: str) -> str:
+        """state が参加用の署名付きのものなら、申し込み（Checkout）のIDを返す。違えば空文字。"""
+        try:
+            data = join_signer.loads(state or "", max_age=JOIN_STATE_MAX_AGE)
+        except BadSignature:  # 期限切れ（SignatureExpired）も含む
+            return ""
+        return data.get("sid", "") if isinstance(data, dict) else ""
+
+    def _finish_join(session_id: str, discord_id: str, discord_name: str, access_token: str):
         try:
             info = referral.checkout_join_info(session_id)
         except referral.ReferralError as error:
@@ -247,7 +262,8 @@ def create_app(bot, run_coro):
         code = request.args.get("code")
         state = request.args.get("state")
 
-        if not code or not state or state != session.get("oauth_state"):
+        join_session_id = _join_session_from_state(state)
+        if not code or not state or (not join_session_id and state != session.get("oauth_state")):
             return render_template("error.html", message="ログインに失敗しました（state不一致）。もう一度お試しください。")
 
         token_res = requests.post(
@@ -281,8 +297,8 @@ def create_app(bot, run_coro):
         discord_id = user_json["id"]
         discord_name = user_json.get("global_name") or user_json.get("username")
 
-        if session.pop("oauth_purpose", "") == "join":
-            return _finish_join(discord_id, discord_name, access_token)
+        if join_session_id:
+            return _finish_join(join_session_id, discord_id, discord_name, access_token)
 
         # 対象サーバーのメンバーかどうかをBot経由で確認する
         try:
