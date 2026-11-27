@@ -2515,6 +2515,30 @@ async def on_member_remove(member: discord.Member):
         print(f"退会した人のマッチングルームの削除でエラー：{error}")
 
     await run_member_archive(member.guild, str(member.id), member.display_name, "サーバーから退出しました")
+    await cancel_stripe_on_leave(member.guild, str(member.id), member.display_name)
+
+
+async def cancel_stripe_on_leave(guild: discord.Guild, discord_id: str, name: str):
+    """退出した人のStripeの契約を「今の支払い期間の終わりで解約」にして、id同期ログに知らせる。"""
+    if not referral.is_configured():
+        return
+    log = find_id_sync_log_channel(guild)
+    try:
+        results = await asyncio.to_thread(referral.cancel_on_leave, discord_id)
+    except Exception as error:  # noqa: BLE001 - 運営に知らせて、手で解約してもらう
+        print(f"退出した人のStripeの解約でエラー：{name}（{discord_id}）：{error}")
+        if log is not None:
+            await log.send(
+                f"⚠️ {name}（ID：{discord_id}）のStripeの契約を自動で解約できませんでした：{error}\n"
+                "Stripeの管理画面で契約を確認し、必要なら解約してください。",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        return
+    if not results or log is None:
+        return  # Discordと結び付いた契約が無い（前からいる会員など）
+    lines = [f"💳 {name}（ID：{discord_id}）のStripeの契約を、支払い期間の終わりで解約するよう設定しました。"]
+    lines += [f"・{r['plan']}：{r['end']} で終了（それまでの分の返金はありません）" for r in results]
+    await log.send("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.command(name="退会処理")
