@@ -2359,7 +2359,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     await run_id_sync(guild, send)
 
 
-async def run_member_archive(guild: discord.Guild, discord_id: str, display_name: str, reason: str):
+async def run_member_archive(
+    guild: discord.Guild, discord_id: str, display_name: str, reason: str, label: str = "🚪"
+):
     """
     退会者の行を「入力シート」から「退会者」シートへ移し、結果を id同期ログ に通知する。
     on_member_remove（キック・自主退会）と、手動の「!退会処理」の両方から呼び出す。
@@ -2383,13 +2385,13 @@ async def run_member_archive(guild: discord.Guild, discord_id: str, display_name
 
     if not result["found"]:
         await send(
-            f"🚪 {display_name}（ID：{discord_id}）が{reason}。"
+            f"{label} {display_name}（ID：{discord_id}）が{reason}。\n"
             "入力シートにこのDiscordIDの行が無いため、シートは変更していません。"
         )
         return
 
     await send(
-        f"🚪 {display_name}（ID：{discord_id}）が{reason}。\n"
+        f"{label} {display_name}（ID：{discord_id}）が{reason}。\n"
         f"「{result['name']}」の{result['moved']}行を、入力シートから退会者シートへ移しました。"
     )
 
@@ -2514,8 +2516,38 @@ async def on_member_remove(member: discord.Member):
     except Exception as error:  # noqa: BLE001 - ルームの処理に失敗しても退会処理は続ける
         print(f"退会した人のマッチングルームの削除でエラー：{error}")
 
-    await run_member_archive(member.guild, str(member.id), member.display_name, "サーバーから退出しました")
+    label, reason = await _leave_reason(member)
+    await run_member_archive(member.guild, str(member.id), member.display_name, reason, label)
     await cancel_stripe_on_leave(member.guild, str(member.id), member.display_name)
+
+
+async def _leave_reason(member: discord.Member) -> tuple[str, str]:
+    """
+    サーバーからいなくなった理由を、監査ログから調べる（キック・BAN・自分から退出）。
+    戻り値：(先頭の目印, 「〇〇が」に続く文)
+    """
+    guild = member.guild
+    await asyncio.sleep(2)  # 監査ログに記録されるまで少し待つ
+    since = datetime.now(timezone.utc) - timedelta(seconds=60)
+    try:
+        for action, label, verb in (
+            (discord.AuditLogAction.ban, "🔨【BAN】", "BANされました"),
+            (discord.AuditLogAction.kick, "👢【キック】", "キックされました"),
+        ):
+            async for entry in guild.audit_logs(limit=10, action=action, after=since):
+                if entry.target is not None and entry.target.id == member.id:
+                    by = entry.user.display_name if entry.user else "不明"
+                    note = f"（理由：{entry.reason}）" if entry.reason else ""
+                    return label, f"{by} さんに{verb}{note}"
+    except discord.Forbidden:
+        return "🚪【退出・理由不明】", (
+            "サーバーからいなくなりました"
+            "（キックか自分から退出かを調べるには、botに「監査ログを表示」の権限が必要です）"
+        )
+    except discord.HTTPException as error:
+        print(f"監査ログを確認できませんでした：{error}")
+        return "🚪【退出・理由不明】", "サーバーからいなくなりました（監査ログを確認できませんでした）"
+    return "🚪【自主退会】", "自分でサーバーから退出しました"
 
 
 async def cancel_stripe_on_leave(guild: discord.Guild, discord_id: str, name: str):
