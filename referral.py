@@ -393,10 +393,14 @@ def _record_subscription(subscription):
         "名前": _get(customer, "name", default=""),
         "メールアドレス": _get(customer, "email", default=""),
         "プラン": _plan_of_subscription(subscription),
-        "状態": {
-            "active": "契約中", "trialing": "お試し中", "past_due": "支払い遅れ", "unpaid": "未払い",
-            "canceled": "解約", "incomplete": "手続き中", "incomplete_expired": "手続き期限切れ", "paused": "一時停止",
-        }.get(_get(subscription, "status", default=""), _get(subscription, "status", default="")),
+        "状態": (
+            f"解約予定（{_date_text(_period_end(subscription))}）"
+            if _get(subscription, "cancel_at_period_end") and _get(subscription, "status") in ("active", "trialing", "past_due")
+            else {
+                "active": "契約中", "trialing": "お試し中", "past_due": "支払い遅れ", "unpaid": "未払い",
+                "canceled": "解約", "incomplete": "手続き中", "incomplete_expired": "手続き期限切れ", "paused": "一時停止",
+            }.get(_get(subscription, "status", default=""), _get(subscription, "status", default=""))
+        ),
         "開始日": _date_text(_get(subscription, "start_date")),
         "解約日": _date_text(ended) if _get(subscription, "status") == "canceled" else "",
         "紹介コード": _get(subscription, "metadata", "referral_code", default=""),
@@ -469,6 +473,55 @@ def link_discord(subscription_id: str, discord_id: str):
     with _lock:
         _stripe().Subscription.modify(subscription_id, metadata={"discord_id": str(discord_id)})
         _record_subscription({"id": subscription_id})
+
+
+def _period_end(subscription):
+    """今の支払い期間の終わり（APIのバージョンによって、サブスクリプション本体か各項目にある）。"""
+    end = _get(subscription, "current_period_end")
+    if end:
+        return end
+    items = _get(subscription, "items", "data", default=[]) or []
+    ends = [_get(item, "current_period_end") for item in items if _get(item, "current_period_end")]
+    return max(ends) if ends else _get(subscription, "cancel_at")
+
+
+def cancel_on_leave(discord_id: str) -> list[dict]:
+    """
+    サーバーから退出した人の、Discordと結び付いた契約を「今の支払い期間の終わりで解約」にする。
+    （支払い済みの期間はそのまま使え、返金はしない）
+    戻り値：解約予定にした契約ごとの {"plan", "end"（YYYY-MM-DD）}。結び付いた契約が無ければ空。
+    """
+    results = []
+    with _lock:
+        subscriptions = {}
+        try:  # Stripe側のメタデータで探す（いちばん確実）
+            found = _stripe().Subscription.search(query=f"metadata['discord_id']:'{int(discord_id)}'", limit=20)
+            subscriptions.update({s["id"]: s for s in found.auto_paging_iter()})
+        except Exception as error:  # noqa: BLE001 - 検索が使えないときは「契約者一覧」から探す
+            print(f"Stripeの契約の検索に失敗したので、契約者一覧から探します：{error}")
+            for row in _rows(SHEET_SUBSCRIBERS):
+                if row["DiscordID"] == str(discord_id) and row["StripeサブスクリプションID"]:
+                    subscriptions[row["StripeサブスクリプションID"]] = _stripe().Subscription.retrieve(
+                        row["StripeサブスクリプションID"]
+                    )
+        for subscription in subscriptions.values():
+            if _get(subscription, "status") not in _ALIVE_STATUSES:
+                continue
+            if not _get(subscription, "cancel_at_period_end"):
+                subscription = _stripe().Subscription.modify(
+                    subscription["id"],
+                    cancel_at_period_end=True,
+                    metadata={"canceled_reason": "Discordサーバーから退出"},
+                )
+            results.append({
+                "plan": _plan_of_subscription(subscription),
+                "end": _date_text(_period_end(subscription)),
+            })
+            try:
+                _record_subscription({"id": subscription["id"]})
+            except Exception as error:  # noqa: BLE001 - 契約者一覧の更新はWebhookでも行われる
+                print(f"契約者一覧の更新に失敗しました：{error}")
+    return results
 
 
 def portal_url_for(discord_id: str, return_url: str) -> str | None:
